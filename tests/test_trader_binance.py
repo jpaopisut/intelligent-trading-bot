@@ -287,6 +287,122 @@ def test_new_limit_order_at_min_notional_proceeds_normally():
     assert App.order == result
 
 
+# ---------------------------------------------------------------------------
+# B04: order-state safety.
+# 1) Callers in trader_binance() must not flip App.status to BUYING/SELLING
+#    when new_limit_order() returns None (order not actually created).
+# 2) Every early-return path inside new_limit_order() must clear App.order
+#    (not leave a stale, previously-FILLED order dict visible).
+# ---------------------------------------------------------------------------
+
+def test_trader_binance_does_not_set_buying_status_when_order_rejected():
+    """
+    Arrange: BUY signal, status SOLD, but the order will be rejected because
+    its notional is below the exchange's minNotional (new_limit_order
+    returns None).
+    Act: run trader_binance().
+    Assert: App.status stays "SOLD" - it must NOT be advanced to "BUYING"
+    just because trading was attempted; only a real returned order may
+    advance status.
+    """
+    _setup_app_for_trader_binance(no_trades_only_data_processing=False)
+    df = _make_buy_signal_df()
+
+    # update_account_balance() always overwrites App.account_info with the
+    # fixed "1000.00000000" balance from the mocked client, so force a
+    # reject via an exchange minNotional above the resulting order notional
+    # (~990 quote units) instead of via account balance.
+    client = _make_fake_binance_client(min_notional="2000.00000000")
+
+    with patch("outputs.trader_binance.collector_binance.client", client):
+        asyncio.run(trader_binance(df, _MODEL, App.config, model_store=None))
+
+    assert App.order is None
+    assert App.status == "SOLD"
+
+
+def test_trader_binance_sets_buying_status_when_order_created():
+    """
+    Arrange: BUY signal, status SOLD, order will actually be created
+    (notional comfortably above minNotional).
+    Act: run trader_binance().
+    Assert: App.status advances to "BUYING" because new_limit_order()
+    returned a real order.
+    """
+    _setup_app_for_trader_binance(no_trades_only_data_processing=False)
+    df = _make_buy_signal_df()
+
+    client = _make_fake_binance_client(min_notional="1.00000000")
+
+    with patch("outputs.trader_binance.collector_binance.client", client):
+        asyncio.run(trader_binance(df, _MODEL, App.config, model_store=None))
+
+    assert App.order is not None
+    assert App.status == "BUYING"
+
+
+def _setup_app_with_stale_order():
+    """Same as _setup_app_for_filters but pre-seeds App.order with a stale FILLED order."""
+    _setup_app_for_filters(base_quantity="1.0", close_price="100.0")
+    App.order = {"symbol": "BTCUSDT", "side": SIDE_SELL, "status": "FILLED", "orderId": 1}
+
+
+def test_new_limit_order_clears_stale_order_when_symbol_info_missing():
+    """
+    Arrange: App.order pre-set to a stale FILLED order; client returns no
+    symbol info at all.
+    Act: call new_limit_order(SIDE_SELL).
+    Assert: returns None and App.order is cleared to None (no stale order
+    left visible).
+    """
+    _setup_app_with_stale_order()
+    client = MagicMock()
+    client.get_symbol_info.return_value = None
+
+    with patch("outputs.trader_binance.collector_binance.client", client):
+        result = asyncio.run(new_limit_order(SIDE_SELL))
+
+    assert result is None
+    assert App.order is None
+
+
+def test_new_limit_order_clears_stale_order_when_filters_missing():
+    """
+    Arrange: App.order pre-set to a stale FILLED order; symbol info is
+    missing the PRICE_FILTER/LOT_SIZE filters.
+    Act: call new_limit_order(SIDE_SELL).
+    Assert: returns None and App.order is cleared to None.
+    """
+    _setup_app_with_stale_order()
+    client = MagicMock()
+    client.get_symbol_info.return_value = {"symbol": "BTCUSDT", "filters": []}
+
+    with patch("outputs.trader_binance.collector_binance.client", client):
+        result = asyncio.run(new_limit_order(SIDE_SELL))
+
+    assert result is None
+    assert App.order is None
+
+
+def test_new_limit_order_clears_stale_order_when_close_price_missing():
+    """
+    Arrange: App.order pre-set to a stale FILLED order; the analyzer's last
+    kline has a close price of "0" (to_decimal("0") == Decimal(0), falsy).
+    Act: call new_limit_order(SIDE_SELL).
+    Assert: returns None and App.order is cleared to None.
+    """
+    _setup_app_with_stale_order()
+    App.analyzer = _make_fake_analyzer(close_price="0")
+    client = MagicMock()
+    client.get_symbol_info.return_value = _make_btcusdt_symbol_info(min_notional="1.00000000")
+
+    with patch("outputs.trader_binance.collector_binance.client", client):
+        result = asyncio.run(new_limit_order(SIDE_SELL))
+
+    assert result is None
+    assert App.order is None
+
+
 def test_new_limit_order_handles_notional_filter_renamed_to_notional():
     """
     Arrange: symbol info uses the newer "NOTIONAL" filter name (Binance

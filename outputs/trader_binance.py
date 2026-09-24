@@ -139,22 +139,26 @@ async def trader_binance(df, model: dict, config: dict, model_store: ModelStore)
 
     if status == "SOLD" and signal_side == "BUY":
         # -----
-        await new_limit_order(side=SIDE_BUY)
+        order = await new_limit_order(side=SIDE_BUY)
 
         if no_trades_only_data_processing:
             print("SKIP TRADING due to 'no_trades_only_data_processing' parameter True")
             # Never change status if orders not executed
-        else:
+        elif order:
             App.status = "BUYING"
+        # Never change status if the order was not actually created (e.g. minNotional
+        # reject, missing symbol info/filters, missing close price, execute failure)
     elif status == "BOUGHT" and signal_side == "SELL":
         # -----
-        await new_limit_order(side=SIDE_SELL)
+        order = await new_limit_order(side=SIDE_SELL)
 
         if no_trades_only_data_processing:
             print("SKIP TRADING due to 'no_trades_only_data_processing' parameter True")
             # Never change status if orders not executed
-        else:
+        elif order:
             App.status = "SELLING"
+        # Never change status if the order was not actually created (e.g. minNotional
+        # reject, missing symbol info/filters, missing close price, execute failure)
 
     log.info(f"<=== End trade task.")
 
@@ -339,6 +343,19 @@ def _round_to_step(value: Decimal, step: Decimal) -> Decimal:
     return (quotient * step).quantize(step, rounding=ROUND_DOWN)
 
 
+def _reject_order(reason: str) -> None:
+    """
+    Log a rejection reason and clear App.order/App.order_time so a stale
+    (e.g. previously FILLED) order never remains visible in App.order after
+    a new order attempt fails. Always returns None so callers can
+    `return _reject_order(...)`.
+    """
+    log.error(reason)
+    App.order = None
+    App.order_time = now_timestamp()
+    return None
+
+
 async def new_limit_order(side):
     """
     Create a new limit sell order with the amount we current have.
@@ -356,8 +373,7 @@ async def new_limit_order(side):
     #
     symbol_info = collector_binance.client.get_symbol_info(symbol)
     if not symbol_info:
-        log.error(f"Cannot retrieve symbol info for {symbol}. Order not submitted.")
-        return None
+        return _reject_order(f"Cannot retrieve symbol info for {symbol}. Order not submitted.")
 
     filters = symbol_info.get("filters", [])
     price_filter = _find_filter(filters, "PRICE_FILTER")
@@ -366,8 +382,7 @@ async def new_limit_order(side):
     notional_filter = _find_filter(filters, "MIN_NOTIONAL", "NOTIONAL")
 
     if not price_filter or not lot_size_filter:
-        log.error(f"Symbol info for {symbol} is missing PRICE_FILTER or LOT_SIZE filter. Order not submitted.")
-        return None
+        return _reject_order(f"Symbol info for {symbol} is missing PRICE_FILTER or LOT_SIZE filter. Order not submitted.")
 
     tick_size = Decimal(price_filter["tickSize"])
     step_size = Decimal(lot_size_filter["stepSize"])
@@ -379,8 +394,7 @@ async def new_limit_order(side):
     last_kline = App.analyzer.get_last_kline(symbol)
     last_close_price = to_decimal(last_kline[4])  # Close price of kline has index 4 in the list
     if not last_close_price:
-        log.error(f"Cannot determine last close price in order to create a market buy order.")
-        return None
+        return _reject_order(f"Cannot determine last close price in order to create a market buy order.")
 
     price_adjustment = trade_model.get("limit_price_adjustment")
     if side == SIDE_BUY:
@@ -413,14 +427,10 @@ async def new_limit_order(side):
     # of letting Binance reject them (or silently mis-rounding them).
     #
     if min_notional is not None and price * quantity < min_notional:
-        log.error(
+        return _reject_order(
             f"Order notional {price * quantity} for {symbol} is below the exchange minNotional "
             f"{min_notional}. Order not submitted."
         )
-        order = None
-        App.order = order
-        App.order_time = now_ts
-        return order
 
     #
     # Execute order
