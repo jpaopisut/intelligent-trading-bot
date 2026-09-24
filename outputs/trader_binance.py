@@ -35,6 +35,12 @@ async def trader_binance(df, model: dict, config: dict, model_store: ModelStore)
     buy_signal_column = model.get("buy_signal_column")
     sell_signal_column = model.get("sell_signal_column")
 
+    # Single canonical source for this flag: config["trade_model"], the same
+    # dict read by new_limit_order()/execute_order(). Do NOT read it from
+    # `model` (the generator's own config block) - that is a different dict
+    # and was the cause of inconsistent dry-run behavior (B02).
+    no_trades_only_data_processing = config.get("trade_model", {}).get("no_trades_only_data_processing")
+
     signal = get_signal(df, buy_signal_column, sell_signal_column)
     signal_side = signal.get("side")
     close_price = signal.get("close_price")
@@ -134,7 +140,7 @@ async def trader_binance(df, model: dict, config: dict, model_store: ModelStore)
         # -----
         await new_limit_order(side=SIDE_BUY)
 
-        if model.get("no_trades_only_data_processing"):
+        if no_trades_only_data_processing:
             print("SKIP TRADING due to 'no_trades_only_data_processing' parameter True")
             # Never change status if orders not executed
         else:
@@ -143,7 +149,7 @@ async def trader_binance(df, model: dict, config: dict, model_store: ModelStore)
         # -----
         await new_limit_order(side=SIDE_SELL)
 
-        if model.get("no_trades_only_data_processing"):
+        if no_trades_only_data_processing:
             print("SKIP TRADING due to 'no_trades_only_data_processing' parameter True")
             # Never change status if orders not executed
         else:
