@@ -253,3 +253,7 @@ config.json
 /config*.json  # Configs may have credentials
 /MODELS/
 /DATA/
+
+# Loop run artifacts and local secrets
+loop/runs/
+configs/local-*.jsonc
