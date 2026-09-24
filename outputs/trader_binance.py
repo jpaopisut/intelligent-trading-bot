@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import hashlib
 import math, time
 from datetime import datetime
 from decimal import *
@@ -139,7 +140,7 @@ async def trader_binance(df, model: dict, config: dict, model_store: ModelStore)
 
     if status == "SOLD" and signal_side == "BUY":
         # -----
-        order = await new_limit_order(side=SIDE_BUY)
+        order = await new_limit_order(side=SIDE_BUY, close_time=close_time)
 
         if no_trades_only_data_processing:
             print("SKIP TRADING due to 'no_trades_only_data_processing' parameter True")
@@ -150,7 +151,7 @@ async def trader_binance(df, model: dict, config: dict, model_store: ModelStore)
         # reject, missing symbol info/filters, missing close price, execute failure)
     elif status == "BOUGHT" and signal_side == "SELL":
         # -----
-        order = await new_limit_order(side=SIDE_SELL)
+        order = await new_limit_order(side=SIDE_SELL, close_time=close_time)
 
         if no_trades_only_data_processing:
             print("SKIP TRADING due to 'no_trades_only_data_processing' parameter True")
@@ -343,6 +344,50 @@ def _round_to_step(value: Decimal, step: Decimal) -> Decimal:
     return (quotient * step).quantize(step, rounding=ROUND_DOWN)
 
 
+def _generate_client_order_id(symbol: str, side: str, close_time) -> str:
+    """
+    Deterministic newClientOrderId for one intended order (symbol, side, close_time).
+
+    Binance limits clientOrderId to 36 characters, so we hash the inputs instead of
+    concatenating them raw (which could exceed the limit or collide after truncation).
+    Same inputs always produce the same id, so a retried submission for the same
+    signal (e.g. after a process restart) reuses the same id and can be reconciled
+    via get_order(origClientOrderId=...) instead of creating a duplicate order (B09).
+    """
+    raw = f"{symbol}-{side}-{close_time}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return f"itb-{digest[:32]}"  # 4 + 32 = 36 chars, within Binance's clientOrderId limit
+
+
+def _get_order_by_client_id(symbol: str, client_order_id: str):
+    """
+    Look up an order by its client-assigned id.
+
+    Used to reconcile state after create_order() raised an exception whose outcome is
+    unknown (e.g. a timeout) or reported a duplicate newClientOrderId, so a retry never
+    creates a second order (B09).
+
+    Returns the order dict if it exists on the exchange, or None if it does not exist
+    there (Binance error code -2013) or the lookup itself fails.
+    """
+    if not client_order_id:
+        return None
+
+    try:
+        return collector_binance.client.get_order(symbol=symbol, origClientOrderId=client_order_id)
+    except BinanceAPIException as e:
+        if getattr(e, "code", None) == -2013:
+            # Order does not exist on the exchange: the original create_order() call
+            # truly failed. Leave the existing B04 "no order" state.
+            log.error(f"No order found for {symbol} with clientOrderId {client_order_id} (code -2013).")
+        else:
+            log.error(f"Binance exception in 'get_order' while reconciling clientOrderId {client_order_id}: {e}")
+        return None
+    except Exception as e:
+        log.error(f"Binance exception in 'get_order' while reconciling clientOrderId {client_order_id}: {e}")
+        return None
+
+
 def _reject_order(reason: str) -> None:
     """
     Log a rejection reason and clear App.order/App.order_time so a stale
@@ -356,13 +401,18 @@ def _reject_order(reason: str) -> None:
     return None
 
 
-async def new_limit_order(side):
+async def new_limit_order(side, close_time=None):
     """
     Create a new limit sell order with the amount we current have.
     The amount is total amount and price is determined according to our strategy (either fixed increase or increase depending on the signal).
+
+    `close_time` is the signal's close_time and is used (together with symbol and side)
+    to derive a deterministic newClientOrderId, so a retried submission for the same
+    signal is idempotent (B09).
     """
     symbol = App.config["symbol"]
     now_ts = now_timestamp()
+    client_order_id = _generate_client_order_id(symbol, side, close_time if close_time is not None else now_ts)
 
     trade_model = App.config.get("trade_model", {})
 
@@ -442,6 +492,7 @@ async def new_limit_order(side):
         timeInForce=TIME_IN_FORCE_GTC,
         quantity=quantity_str,
         price=price_str,
+        newClientOrderId=client_order_id,
     )
 
     if trade_model.get("no_trades_only_data_processing"):
@@ -482,12 +533,31 @@ def execute_order(order: dict):
     else:
         # -----
         # Submit order
+        symbol = order.get("symbol")
+        client_order_id = order.get("newClientOrderId")
         try:
             log.info(f"Submitting order: {order}")
             order = collector_binance.client.create_order(**order)
         except Exception as e:
-            log.error(f"Binance exception in 'create_order' {e}")
-            return
+            # The outcome of create_order() is unknown here: it may have failed before
+            # reaching the exchange, or it may have succeeded while the response was
+            # lost (e.g. a timeout), or Binance may have rejected it as a duplicate
+            # newClientOrderId (code -2010) because a previous attempt already went
+            # through. In all these cases we must NOT assume failure and silently
+            # retry (that could create a duplicate order); instead reconcile with the
+            # exchange using the same deterministic clientOrderId (B09).
+            code = getattr(e, "code", None)
+            if code == -2010:
+                log.warning(
+                    f"Duplicate newClientOrderId {client_order_id} for {symbol}: "
+                    f"reconciling with the existing order instead of resubmitting."
+                )
+            else:
+                log.error(
+                    f"Binance exception in 'create_order' {e}. Reconciling with the "
+                    f"exchange via clientOrderId {client_order_id} before giving up."
+                )
+            return _get_order_by_client_id(symbol, client_order_id)
 
         if not order or not order.get("status"):
             return None
