@@ -4,6 +4,7 @@ import argparse
 import math, time
 from datetime import datetime
 from decimal import *
+from typing import Union
 
 import pandas as pd
 import asyncio
@@ -313,6 +314,31 @@ async def cancel_order():
 # Order creation
 #
 
+def _find_filter(filters: list, *filter_types: str) -> Union[dict, None]:
+    """Return the first filter dict in `filters` whose filterType is one of `filter_types`."""
+    for filter_type in filter_types:
+        for f in filters:
+            if f.get("filterType") == filter_type:
+                return f
+    return None
+
+
+def _decimals_for_step(step: Decimal) -> int:
+    """Number of decimal digits implied by an exchange tickSize/stepSize value."""
+    exponent = step.normalize().as_tuple().exponent
+    return max(-exponent, 0)
+
+
+def _round_to_step(value: Decimal, step: Decimal) -> Decimal:
+    """Round `value` down to the nearest multiple of `step`, using Decimal arithmetic only."""
+    value = value if isinstance(value, Decimal) else Decimal(str(value))
+    if step <= 0:
+        return value
+    step = step.normalize()
+    quotient = (value / step).to_integral_value(rounding=ROUND_DOWN)
+    return (quotient * step).quantize(step, rounding=ROUND_DOWN)
+
+
 async def new_limit_order(side):
     """
     Create a new limit sell order with the amount we current have.
@@ -322,6 +348,30 @@ async def new_limit_order(side):
     now_ts = now_timestamp()
 
     trade_model = App.config.get("trade_model", {})
+
+    #
+    # Fetch exchange trading rules (tickSize, stepSize, minNotional) for this symbol.
+    # These must be respected instead of a hardcoded rounding precision, otherwise a
+    # live order can be rejected by Binance or rounded incorrectly.
+    #
+    symbol_info = collector_binance.client.get_symbol_info(symbol)
+    if not symbol_info:
+        log.error(f"Cannot retrieve symbol info for {symbol}. Order not submitted.")
+        return None
+
+    filters = symbol_info.get("filters", [])
+    price_filter = _find_filter(filters, "PRICE_FILTER")
+    lot_size_filter = _find_filter(filters, "LOT_SIZE")
+    # Binance renamed this filter from MIN_NOTIONAL to NOTIONAL on some symbols.
+    notional_filter = _find_filter(filters, "MIN_NOTIONAL", "NOTIONAL")
+
+    if not price_filter or not lot_size_filter:
+        log.error(f"Symbol info for {symbol} is missing PRICE_FILTER or LOT_SIZE filter. Order not submitted.")
+        return None
+
+    tick_size = Decimal(price_filter["tickSize"])
+    step_size = Decimal(lot_size_filter["stepSize"])
+    min_notional = Decimal(notional_filter["minNotional"]) if notional_filter else None
 
     #
     # Find limit price (from signal, last kline and adjustment parameters)
@@ -338,8 +388,8 @@ async def new_limit_order(side):
     elif side == SIDE_SELL:
         price = last_close_price * Decimal(1.0 + price_adjustment)  # Adjust price slightly higher
 
-    price_str = round_str(price, 2)
-    price = Decimal(price_str)  # We will use the adjusted price for computing quantity
+    price = _round_to_step(price, tick_size)  # Round down to the exchange's tickSize
+    price_str = f"{price:.{_decimals_for_step(tick_size)}f}"
 
     #
     # Find quantity
@@ -355,7 +405,22 @@ async def new_limit_order(side):
         # All available BTCs
         quantity = App.account_info.base_quantity  # BTC
 
-    quantity_str = round_down_str(quantity, 6)
+    quantity = _round_to_step(quantity, step_size)  # Round down to the exchange's stepSize
+    quantity_str = f"{quantity:.{_decimals_for_step(step_size)}f}"
+
+    #
+    # Reject orders that do not meet the exchange's minimum notional value instead
+    # of letting Binance reject them (or silently mis-rounding them).
+    #
+    if min_notional is not None and price * quantity < min_notional:
+        log.error(
+            f"Order notional {price * quantity} for {symbol} is below the exchange minNotional "
+            f"{min_notional}. Order not submitted."
+        )
+        order = None
+        App.order = order
+        App.order_time = now_ts
+        return order
 
     #
     # Execute order

@@ -57,7 +57,7 @@ def test_new_limit_order_dry_run_returns_none_and_sets_app_order_none():
     """
     _setup_app(no_trades_only_data_processing=True)
 
-    with patch("outputs.trader_binance.collector_binance.client", MagicMock()):
+    with patch("outputs.trader_binance.collector_binance.client", _make_fake_binance_client()):
         result = asyncio.run(new_limit_order(SIDE_SELL))
 
     assert result is None
@@ -74,7 +74,7 @@ def test_new_limit_order_execute_path_still_returns_order():
     """
     _setup_app(no_trades_only_data_processing=False)
 
-    with patch("outputs.trader_binance.collector_binance.client", MagicMock()):
+    with patch("outputs.trader_binance.collector_binance.client", _make_fake_binance_client()):
         result = asyncio.run(new_limit_order(SIDE_SELL))
 
     assert result is not None
@@ -119,10 +119,42 @@ def _setup_app_for_trader_binance(no_trades_only_data_processing: bool):
     App.status = "SOLD"  # So that a BUY signal triggers a new BUY order
 
 
-def _make_fake_binance_client():
+def _make_fake_binance_client(min_notional="1.00000000"):
     client = MagicMock()
     client.get_asset_balance.side_effect = lambda asset: {"free": "1000.00000000"}
+    client.get_symbol_info.return_value = _make_btcusdt_symbol_info(min_notional=min_notional)
     return client
+
+
+def _make_btcusdt_symbol_info(min_notional_key="MIN_NOTIONAL", min_notional="1.00000000"):
+    """
+    A realistic (trimmed) Binance BTCUSDT-like exchangeInfo symbol entry.
+    `min_notional_key` lets tests exercise both the legacy "MIN_NOTIONAL"
+    filter name and the newer "NOTIONAL" filter name Binance uses on some
+    symbols now.
+    """
+    return {
+        "symbol": "BTCUSDT",
+        "filters": [
+            {
+                "filterType": "PRICE_FILTER",
+                "minPrice": "0.01000000",
+                "maxPrice": "1000000.00000000",
+                "tickSize": "0.01000000",
+            },
+            {
+                "filterType": "LOT_SIZE",
+                "minQty": "0.00001000",
+                "maxQty": "9000.00000000",
+                "stepSize": "0.00001000",
+            },
+            {
+                "filterType": min_notional_key,
+                "minNotional": min_notional,
+                "applyToMarket": True,
+            },
+        ],
+    }
 
 
 # `model` intentionally does NOT contain "no_trades_only_data_processing":
@@ -166,3 +198,110 @@ def test_trader_binance_flag_false_does_not_skip_order_submission():
     assert App.order is not None
     assert App.order["side"] == SIDE_BUY
     assert App.status == "BUYING"
+
+
+# ---------------------------------------------------------------------------
+# B03: exchange filters (PRICE_FILTER.tickSize, LOT_SIZE.stepSize,
+# MIN_NOTIONAL/NOTIONAL.minNotional) must be consulted, instead of the
+# hardcoded round(2)/round_down(6) that ignored the exchange's real rules.
+# ---------------------------------------------------------------------------
+
+def _setup_app_for_filters(base_quantity, close_price="100.03"):
+    App.config["symbol"] = "BTCUSDT"
+    App.config["trade_model"] = {
+        "no_trades_only_data_processing": False,
+        "simulate_order_execution": True,  # avoid any real Binance client call
+        "limit_price_adjustment": 0.001,
+        "percentage_used_for_trade": 99,
+    }
+    App.analyzer = _make_fake_analyzer(close_price=close_price)
+    App.account_info = AccountBalances()
+    App.account_info.base_quantity = Decimal(base_quantity)
+    App.account_info.quote_quantity = Decimal("1000")
+    App.order = "not-none-sentinel"
+
+
+def test_new_limit_order_rounds_price_and_quantity_to_exchange_tick_and_step():
+    """
+    Arrange: SELL order whose naive price/quantity do not land on tickSize
+    (0.05) / stepSize (0.0001) boundaries.
+    Act: call new_limit_order(SIDE_SELL).
+    Assert: price and quantity are floored (rounded down) to the nearest
+    tick/step using Decimal arithmetic, not the old hardcoded round(2)/
+    round_down(6).
+    """
+    _setup_app_for_filters(base_quantity="0.123456789", close_price="100.03")
+    # price = 100.03 * 1.001 = 100.13003 -> floored to nearest 0.05 = 100.10
+    # quantity = 0.123456789 -> floored to nearest 0.0001 = 0.1234
+    client = MagicMock()
+    client.get_symbol_info.return_value = _make_btcusdt_symbol_info(min_notional="1.00000000")
+    client.get_symbol_info.return_value["filters"][0]["tickSize"] = "0.05000000"
+    client.get_symbol_info.return_value["filters"][1]["stepSize"] = "0.00010000"
+
+    with patch("outputs.trader_binance.collector_binance.client", client):
+        result = asyncio.run(new_limit_order(SIDE_SELL))
+
+    assert result is not None
+    assert result["price"] == "100.10"
+    assert result["quantity"] == "0.1234"
+
+
+def test_new_limit_order_below_min_notional_returns_none_and_does_not_submit():
+    """
+    Arrange: price * quantity computed below the exchange's minNotional.
+    Act: call new_limit_order(SIDE_SELL).
+    Assert: the order is not submitted (no create_order/create_test_order
+    call), the function returns None and App.order is set to None.
+    """
+    _setup_app_for_filters(base_quantity="0.0001", close_price="100.0")
+    # price ~= 100.1, quantity = 0.0001 -> notional ~= 0.01001, well below 10.
+    client = MagicMock()
+    client.get_symbol_info.return_value = _make_btcusdt_symbol_info(min_notional="10.00000000")
+
+    with patch("outputs.trader_binance.collector_binance.client", client):
+        result = asyncio.run(new_limit_order(SIDE_SELL))
+
+    assert result is None
+    assert App.order is None
+    client.create_order.assert_not_called()
+    client.create_test_order.assert_not_called()
+
+
+def test_new_limit_order_at_min_notional_proceeds_normally():
+    """
+    Arrange: price * quantity computed at/above minNotional.
+    Act: call new_limit_order(SIDE_SELL).
+    Assert: existing (pre-B03) behavior is preserved - the order is built
+    and returned.
+    """
+    _setup_app_for_filters(base_quantity="1.0", close_price="100.0")
+    # price ~= 100.1, quantity = 1.0 -> notional ~= 100.1, well above 10.
+    client = MagicMock()
+    client.get_symbol_info.return_value = _make_btcusdt_symbol_info(min_notional="10.00000000")
+
+    with patch("outputs.trader_binance.collector_binance.client", client):
+        result = asyncio.run(new_limit_order(SIDE_SELL))
+
+    assert result is not None
+    assert result["side"] == SIDE_SELL
+    assert App.order == result
+
+
+def test_new_limit_order_handles_notional_filter_renamed_to_notional():
+    """
+    Arrange: symbol info uses the newer "NOTIONAL" filter name (Binance
+    renamed MIN_NOTIONAL on some symbols) instead of "MIN_NOTIONAL".
+    Act: call new_limit_order(SIDE_SELL) with a notional below the limit.
+    Assert: the "NOTIONAL" filter is still honored and the order is blocked.
+    """
+    _setup_app_for_filters(base_quantity="0.0001", close_price="100.0")
+    client = MagicMock()
+    client.get_symbol_info.return_value = _make_btcusdt_symbol_info(
+        min_notional_key="NOTIONAL", min_notional="10.00000000"
+    )
+
+    with patch("outputs.trader_binance.collector_binance.client", client):
+        result = asyncio.run(new_limit_order(SIDE_SELL))
+
+    assert result is None
+    assert App.order is None
