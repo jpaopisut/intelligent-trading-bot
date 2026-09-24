@@ -48,6 +48,12 @@ async def trader_mt5(df: pd.DataFrame, model: dict, config: dict, model_store: M
     buy_signal_column = model.get("buy_signal_column")
     sell_signal_column = model.get("sell_signal_column")
 
+    # Single canonical source for this flag: config["trade_model"], the same
+    # dict read by new_limit_order(). Do NOT read it from `model` (the
+    # generator's own config block) - that is a different dict and was the
+    # cause of inconsistent dry-run behavior (B05, mirrors B02 fix).
+    no_trades_only_data_processing = config.get("trade_model", {}).get("no_trades_only_data_processing")
+
     signal = get_signal(df, buy_signal_column, sell_signal_column)
     signal_side = signal.get("side")
     close_price = signal.get("close_price")
@@ -147,7 +153,7 @@ async def trader_mt5(df: pd.DataFrame, model: dict, config: dict, model_store: M
         # -----
         await new_limit_order(side=mt5.ORDER_TYPE_BUY_LIMIT)
 
-        if model.get("no_trades_only_data_processing"):
+        if no_trades_only_data_processing:
             print("SKIP TRADING due to 'no_trades_only_data_processing' parameter True")
             # Never change status if orders not executed
         else:
@@ -156,7 +162,7 @@ async def trader_mt5(df: pd.DataFrame, model: dict, config: dict, model_store: M
         # -----
         await new_limit_order(symbol, side=mt5.ORDER_TYPE_SELL)
 
-        if model.get("no_trades_only_data_processing"):
+        if no_trades_only_data_processing:
             print("SKIP TRADING due to 'no_trades_only_data_processing' parameter True")
             # Never change status if orders not executed
         else:
