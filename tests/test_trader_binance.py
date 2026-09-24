@@ -20,10 +20,11 @@ import pandas as pd
 import pytest
 
 from binance.enums import SIDE_BUY, SIDE_SELL
+from binance.exceptions import BinanceAPIException
 
 from service.App import App
 from common.types import AccountBalances
-from outputs.trader_binance import new_limit_order, trader_binance
+from outputs.trader_binance import _generate_client_order_id, new_limit_order, trader_binance
 
 
 def _make_fake_analyzer(close_price="100.0"):
@@ -421,3 +422,151 @@ def test_new_limit_order_handles_notional_filter_renamed_to_notional():
 
     assert result is None
     assert App.order is None
+
+
+# ---------------------------------------------------------------------------
+# B09: create_order() must be idempotent via a deterministic newClientOrderId,
+# and any create_order() failure/timeout must be reconciled with the exchange
+# (via get_order(origClientOrderId=...)) instead of assumed to have failed.
+# ---------------------------------------------------------------------------
+
+def _make_binance_api_exception(code: int, message: str = "error"):
+    """Build a BinanceAPIException carrying a given Binance error `code`."""
+    text = f'{{"code": {code}, "msg": "{message}"}}'
+    response = MagicMock()
+    response.text = text
+    return BinanceAPIException(response, 400, text)
+
+
+def test_generate_client_order_id_is_deterministic_and_within_length_limit():
+    """
+    Same (symbol, side, close_time) must always produce the same id (needed for
+    idempotent retries), and the id must respect Binance's 36-char clientOrderId limit.
+    """
+    id1 = _generate_client_order_id("BTCUSDT", SIDE_BUY, "2024-01-01T00:01:00")
+    id2 = _generate_client_order_id("BTCUSDT", SIDE_BUY, "2024-01-01T00:01:00")
+    id3 = _generate_client_order_id("BTCUSDT", SIDE_SELL, "2024-01-01T00:01:00")
+
+    assert id1 == id2
+    assert id1 != id3
+    assert len(id1) <= 36
+
+
+def test_new_limit_order_success_path_passes_deterministic_client_order_id():
+    """
+    Regression test: on a normal successful create_order() call, the order is
+    submitted with a newClientOrderId derived from (symbol, side, close_time),
+    and App.order reflects the returned order (no reconciliation needed).
+    """
+    _setup_app_for_filters(base_quantity="1.0", close_price="100.0")
+    App.config["trade_model"]["simulate_order_execution"] = False
+    close_time = "2024-01-01T00:05:00"
+    expected_id = _generate_client_order_id("BTCUSDT", SIDE_SELL, close_time)
+
+    client = MagicMock()
+    client.get_symbol_info.return_value = _make_btcusdt_symbol_info(min_notional="1.00000000")
+    returned_order = {
+        "symbol": "BTCUSDT", "side": SIDE_SELL, "status": "NEW", "orderId": 42,
+        "newClientOrderId": expected_id,
+    }
+    client.create_order.return_value = returned_order
+
+    with patch("outputs.trader_binance.collector_binance.client", client):
+        result = asyncio.run(new_limit_order(SIDE_SELL, close_time=close_time))
+
+    assert result == returned_order
+    assert App.order == returned_order
+    _, kwargs = client.create_order.call_args
+    assert kwargs["newClientOrderId"] == expected_id
+    client.get_order.assert_not_called()
+
+
+def test_new_limit_order_create_order_exception_then_order_found_is_adopted():
+    """
+    Arrange: create_order() raises (e.g. a timeout - the outcome on the exchange
+    is unknown).
+    Act: new_limit_order() must NOT assume the order failed; it looks up the order
+    by the same clientOrderId and, since it exists on the exchange, adopts it
+    instead of retrying create_order().
+    Assert: the looked-up order is returned/stored, create_order() was called
+    exactly once (no blind retry/duplicate), and get_order() used the same id.
+    """
+    _setup_app_for_filters(base_quantity="1.0", close_price="100.0")
+    App.config["trade_model"]["simulate_order_execution"] = False
+    close_time = "2024-01-01T00:06:00"
+    expected_id = _generate_client_order_id("BTCUSDT", SIDE_SELL, close_time)
+
+    client = MagicMock()
+    client.get_symbol_info.return_value = _make_btcusdt_symbol_info(min_notional="1.00000000")
+    client.create_order.side_effect = TimeoutError("request timed out")
+    existing_order = {
+        "symbol": "BTCUSDT", "side": SIDE_SELL, "status": "NEW", "orderId": 99,
+        "newClientOrderId": expected_id,
+    }
+    client.get_order.return_value = existing_order
+
+    with patch("outputs.trader_binance.collector_binance.client", client):
+        result = asyncio.run(new_limit_order(SIDE_SELL, close_time=close_time))
+
+    assert result == existing_order
+    assert App.order == existing_order
+    client.get_order.assert_called_once_with(symbol="BTCUSDT", origClientOrderId=expected_id)
+    client.create_order.assert_called_once()
+
+
+def test_new_limit_order_create_order_exception_then_order_not_found_leaves_no_order_state():
+    """
+    Arrange: create_order() raises (timeout), and the follow-up get_order() lookup
+    reports the order does not exist on the exchange (Binance error code -2013).
+    Act/Assert: new_limit_order() falls back to the established B04 "no order"
+    state (returns None, App.order cleared) - no exception propagates.
+    """
+    _setup_app_for_filters(base_quantity="1.0", close_price="100.0")
+    App.config["trade_model"]["simulate_order_execution"] = False
+    close_time = "2024-01-01T00:07:00"
+    expected_id = _generate_client_order_id("BTCUSDT", SIDE_SELL, close_time)
+
+    client = MagicMock()
+    client.get_symbol_info.return_value = _make_btcusdt_symbol_info(min_notional="1.00000000")
+    client.create_order.side_effect = TimeoutError("request timed out")
+    client.get_order.side_effect = _make_binance_api_exception(-2013, "Order does not exist.")
+
+    with patch("outputs.trader_binance.collector_binance.client", client):
+        result = asyncio.run(new_limit_order(SIDE_SELL, close_time=close_time))
+
+    assert result is None
+    assert App.order is None
+    client.get_order.assert_called_once_with(symbol="BTCUSDT", origClientOrderId=expected_id)
+
+
+def test_new_limit_order_duplicate_client_order_id_adopts_existing_order():
+    """
+    Arrange: create_order() raises a duplicate newClientOrderId error (Binance
+    error code -2010), e.g. because a previous submission with the same
+    deterministic id already went through (a retried cycle after a restart).
+    Act: new_limit_order() must fetch and adopt the existing order via
+    get_order() instead of creating a duplicate order.
+    Assert: the existing order is returned/stored and create_order() was called
+    exactly once (no duplicate submission).
+    """
+    _setup_app_for_filters(base_quantity="1.0", close_price="100.0")
+    App.config["trade_model"]["simulate_order_execution"] = False
+    close_time = "2024-01-01T00:08:00"
+    expected_id = _generate_client_order_id("BTCUSDT", SIDE_SELL, close_time)
+
+    client = MagicMock()
+    client.get_symbol_info.return_value = _make_btcusdt_symbol_info(min_notional="1.00000000")
+    client.create_order.side_effect = _make_binance_api_exception(-2010, "Duplicate order sent.")
+    existing_order = {
+        "symbol": "BTCUSDT", "side": SIDE_SELL, "status": "NEW", "orderId": 123,
+        "newClientOrderId": expected_id,
+    }
+    client.get_order.return_value = existing_order
+
+    with patch("outputs.trader_binance.collector_binance.client", client):
+        result = asyncio.run(new_limit_order(SIDE_SELL, close_time=close_time))
+
+    assert result == existing_order
+    assert App.order == existing_order
+    client.get_order.assert_called_once_with(symbol="BTCUSDT", origClientOrderId=expected_id)
+    client.create_order.assert_called_once()
