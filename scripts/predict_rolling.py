@@ -1,6 +1,8 @@
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 import time
+import shutil
+import tempfile
 import click
 from concurrent.futures import ProcessPoolExecutor
 from joblib import Parallel, delayed
@@ -164,50 +166,41 @@ def main(config_file):
 
     use_multiprocessing = rp_config.get("use_multiprocessing", False)
     max_workers = rp_config.get("max_workers", None)
+
     if use_multiprocessing:
-        parallel = Parallel(n_jobs=max_workers, backend="loky", verbose=13)  # ['loky', 'multiprocessing', 'sequential', 'threading']
-        #parallel = mp.Pool(processes=max_workers)
-        #parallel = ProcessPoolExecutor(max_workers=max_workers)
+        # Parallelise across walk-forward steps (they are independent given the fixed data).
+        # Each worker computes its own train/predict slice and must NOT nest another
+        # multiprocessing pool inside (parallel=None passed to execute_train_predict_step).
+        step_parallel = Parallel(n_jobs=max_workers, backend="loky", verbose=13)
+        step_results = step_parallel(
+            delayed(_run_one_step)(
+                config, df, step, prediction_start, prediction_size,
+                label_horizon, train_length, train_features_all,
+                isolate_model_store=True,
+            )
+            for step in range(prediction_steps)
+        )
+        # step_results is already returned in submission (step) order by joblib.Parallel,
+        # regardless of worker completion order, so concatenation below preserves step order.
+        for step, predict_labels_df in step_results:
+            labels_hat_df = pd.concat([labels_hat_df, predict_labels_df])
     else:
         parallel = None
 
-    for step in range(prediction_steps):
+        for step in range(prediction_steps):
+            step_start_time = datetime.now()
 
-        # Predict data
+            _, predict_labels_df = _run_one_step(
+                config, df, step, prediction_start, prediction_size,
+                label_horizon, train_length, train_features_all,
+                parallel=parallel,
+            )
 
-        predict_start = prediction_start + (step * prediction_size)
-        predict_end = predict_start + prediction_size
+            # Append predicted rows to the end of previous predicted rows
+            labels_hat_df = pd.concat([labels_hat_df, predict_labels_df])
 
-        predict_df = df.iloc[predict_start:predict_end]  # Assume iloc equal to index
-        df_X_test = predict_df[train_features_all]
-
-        # Train data
-
-        # We exclude recent objects from training, because they do not have labels yet - the labels are in future
-        # In real (stream) data, we will have null labels for recent objects. During simulation, labels are available and hence we need to ignore/exclude them manually
-        train_end = predict_start - label_horizon - 1
-        if train_length:
-            train_start = max(0, train_end - train_length)
-        else:
-            train_start = 0
-
-        train_df = df.iloc[train_start:train_end]  # We assume that iloc is equal to index
-        train_df = train_df.dropna(subset=train_features_all)
-
-        print(f"\n===>>> Start step {step}/{prediction_steps}. Train range: [{train_start}, {train_end}]={train_end-train_start}. Prediction range: [{predict_start}, {predict_end}]={predict_end-predict_start}")
-
-        step_start_time = datetime.now()
-
-        #
-        # Real execution of one step
-        #
-        predict_labels_df = execute_train_predict_step(config, train_df, predict_df, parallel)
-
-        # Append predicted rows to the end of previous predicted rows
-        labels_hat_df = pd.concat([labels_hat_df, predict_labels_df])
-
-        elapsed = datetime.now() - step_start_time
-        print(f"End step {step}/{prediction_steps}. Scores predicted: {len(predict_labels_df.columns)}. Time elapsed: {str(elapsed).split('.')[0]}")
+            elapsed = datetime.now() - step_start_time
+            print(f"End step {step}/{prediction_steps}. Scores predicted: {len(predict_labels_df.columns)}. Time elapsed: {str(elapsed).split('.')[0]}")
 
     # End of loop over prediction steps
     print("")
@@ -271,6 +264,100 @@ def main(config_file):
     #
     elapsed = datetime.now() - now
     print(f"Finished rolling prediction in {str(elapsed).split('.')[0]}")
+
+
+def _run_one_step(
+    config: dict,
+    df: pd.DataFrame,
+    step: int,
+    prediction_start: int,
+    prediction_size: int,
+    label_horizon: int,
+    train_length: int,
+    train_features_all: list,
+    parallel=None,
+    isolate_model_store: bool = False,
+):
+    """
+    Compute the train/predict slices for one walk-forward step and execute train+predict on them.
+
+    This is the unit of work for both the sequential loop and the per-step parallel loop in
+    main(). When called from the parallel loop, ``parallel`` must be None so that the worker
+    process does not itself spawn a nested multiprocessing pool.
+
+    When ``isolate_model_store`` is True (used by the per-step parallel loop), this function
+    creates a private, process-local ModelStore backed by a temporary directory instead of
+    relying on the shared ``App.model_store`` global. This is required because:
+    - joblib's "loky" backend spawns fresh worker processes that do not inherit the
+      ``App.model_store`` object created in the main process (it would be None there), and
+    - concurrently running steps must not read/write the same model files on disk (the
+      sequential loop is safe because only one step's model files exist on disk at a time).
+    The temporary directory is removed again once the step has completed.
+
+    :return: tuple (step, predict_labels_df) so that callers relying on out-of-order completion
+        (e.g. joblib workers) can still recover the correct step order if needed.
+    """
+    tmp_model_dir = None
+    if isolate_model_store:
+        tmp_model_dir = tempfile.mkdtemp(prefix=f"itb_rolling_predict_step_{step}_")
+        step_config = dict(config)
+        step_config["model_folder"] = tmp_model_dir
+        App.model_store = ModelStore(step_config)
+
+    try:
+        return _run_one_step_inner(
+            config, df, step, prediction_start, prediction_size,
+            label_horizon, train_length, train_features_all, parallel,
+        )
+    finally:
+        if tmp_model_dir:
+            shutil.rmtree(tmp_model_dir, ignore_errors=True)
+
+
+def _run_one_step_inner(
+    config: dict,
+    df: pd.DataFrame,
+    step: int,
+    prediction_start: int,
+    prediction_size: int,
+    label_horizon: int,
+    train_length: int,
+    train_features_all: list,
+    parallel=None,
+):
+    # Predict data
+
+    predict_start = prediction_start + (step * prediction_size)
+    predict_end = predict_start + prediction_size
+
+    predict_df = df.iloc[predict_start:predict_end]  # Assume iloc equal to index
+
+    # Train data
+
+    # We exclude recent objects from training, because they do not have labels yet - the labels are in future
+    # In real (stream) data, we will have null labels for recent objects. During simulation, labels are available and hence we need to ignore/exclude them manually
+    train_end = predict_start - label_horizon - 1
+    if train_length:
+        train_start = max(0, train_end - train_length)
+    else:
+        train_start = 0
+
+    train_df = df.iloc[train_start:train_end]  # We assume that iloc is equal to index
+    train_df = train_df.dropna(subset=train_features_all)
+
+    print(f"\n===>>> Start step {step}. Train range: [{train_start}, {train_end}]={train_end-train_start}. Prediction range: [{predict_start}, {predict_end}]={predict_end-predict_start}")
+
+    step_start_time = datetime.now()
+
+    #
+    # Real execution of one step
+    #
+    predict_labels_df = execute_train_predict_step(config, train_df, predict_df, parallel)
+
+    elapsed = datetime.now() - step_start_time
+    print(f"End step {step}. Scores predicted: {len(predict_labels_df.columns)}. Time elapsed: {str(elapsed).split('.')[0]}")
+
+    return step, predict_labels_df
 
 
 def execute_train_predict_step(config: dict, train_df: pd.DataFrame, predict_df: pd.DataFrame, parallel):
