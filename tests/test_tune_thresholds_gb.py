@@ -1,6 +1,7 @@
 import pytest
 
-from loop.scripts.tune_thresholds_gb import passes_bar, MIN_TRADES, MIN_PF, MAX_EXPOSURE
+tuner = pytest.importorskip("loop.scripts.tune_thresholds_gb", reason="loop/ tooling is not part of every checkout")
+passes_bar, MIN_TRADES, MIN_PF, MAX_EXPOSURE = tuner.passes_bar, tuner.MIN_TRADES, tuner.MIN_PF, tuner.MAX_EXPOSURE
 
 
 def _row(trades=50, profit_factor=1.5, exposure=40.0):

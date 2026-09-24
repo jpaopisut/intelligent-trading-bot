@@ -25,6 +25,9 @@ def _load_module():
     return module
 
 
+if not SCRIPT_PATH.exists():  # .claude/ tooling is not part of every checkout
+    pytest.skip(f"{SCRIPT_PATH} not present", allow_module_level=True)
+
 evaluate_signals = _load_module()
 
 
