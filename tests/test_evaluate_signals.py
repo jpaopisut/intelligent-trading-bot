@@ -93,3 +93,27 @@ def test_load_frame_produces_tz_aware_timestamp_column(tmp_path):
 
     # Assert
     assert df["timestamp"].dtype.tz is not None
+
+
+def test_nan_price_rows_do_not_corrupt_equity_metrics(tmp_path):
+    # Arrange: exchange-outage rows have NaN prices (as produced by scripts.merge raster filling)
+    times = pd.date_range("2025-01-01T00:00:00Z", periods=8, freq="h")
+    df = pd.DataFrame({
+        "timestamp": times.strftime("%Y-%m-%dT%H:%M:%S.%f+00:00"),
+        "open":  [100.0, 100.0, 102.0, float("nan"), float("nan"), 104.0, 103.0, 103.0],
+        "close": [100.0, 102.0, 103.0, float("nan"), float("nan"), 103.0, 103.0, 103.0],
+        "buy_signal_column":  [True, False, False, False, False, False, False, False],
+        "sell_signal_column": [False, False, False, False, True, False, False, False],
+    })
+    file = tmp_path / "signals.csv"
+    df.to_csv(file, index=False)
+    args = evaluate_signals.build_parser().parse_args(["--file", str(file), "--fee", "0", "--slippage", "0"])
+
+    # Act
+    result = evaluate_signals.run(args)["ALL"]
+
+    # Assert: metrics are finite; the sell signal on a NaN bar executes at the next valid open (104)
+    assert result["max_drawdown_%"] == result["max_drawdown_%"]  # not NaN
+    assert result["sharpe"] == result["sharpe"] and result["sharpe"] != 0.0
+    assert result["trades"] == 1
+    assert result["net_return_%"] == pytest.approx(round(100 * (104 / 100 - 1), 2))
