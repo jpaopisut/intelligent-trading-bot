@@ -28,13 +28,12 @@ def test_extremum_labels():
     extr_y = [sr[x] for x in extr_x]
     extr_df = pd.DataFrame({'x': extr_x, 'y': extr_y})
 
-    import seaborn as sns
-    # https://matplotlib.org/stable/api/markers_api.html
-    # '-', '--', '-.', ':', 'None', ' ', '', 'solid', 'dashed', 'dashdot', 'dotted'
-    sns.lineplot(data=sr)
-    sns.lineplot(data=extr_df, x="x", y="y", marker="o", markersize=10, linestyle='dotted')  # "^" 'v'
-
-    pass
+    # Plotting with seaborn was here for manual/visual debugging only (seaborn is an
+    # optional dependency, see requirements.txt) and is not part of the actual test.
+    # The test itself only needs to verify that extremum detection runs without errors
+    # and produces a non-empty result.
+    assert len(extr_x) > 0
+    assert len(extr_df) == len(extr_x)
 
 def test_interval_and_aggregation():
     data = [10, 40, 30, 70, 90, 50, 60, 30, 9]
@@ -51,8 +50,11 @@ def test_interval_and_aggregation():
     # Add label
     df, _ = add_extremum_features(df, column_name='close', level_fracs=[level_frac], tolerance_frac=tolerance_frac, out_names=['is_close_top'])
 
-    # Aggregate score with chosen parameters
-    aggregate_scores(df, 'score_agg', ['score'], None, 2)
+    # Aggregate score with chosen parameters.
+    # `aggregate_scores` was deprecated and removed (see commit 0a2f3c4), replaced by
+    # `generate_smoothen_scores` which uses a config dict instead of positional parameters.
+    smoothen_config = {"columns": ["score"], "window": 2, "names": "score_agg"}
+    df, _ = generate_smoothen_scores(df, smoothen_config)
 
     threshold = 6
     interval_df = find_interval_precision(df, label_column='is_close_top', score_column='score_agg', threshold=threshold)
