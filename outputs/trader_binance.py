@@ -365,6 +365,7 @@ async def new_limit_order(side):
 
     if trade_model.get("no_trades_only_data_processing"):
         print(f"NOT executed order spec: {order_spec}")
+        order = None
     else:
         order = execute_order(order_spec)
 
