@@ -246,7 +246,27 @@ async def update_trade_status():
             log.error(f"Neither SELL nor BUY side of the order {order}.")
             return None
 
+        # B12: an open order was found on the exchange but App.order did not
+        # reference it (e.g. after a restart, or App.order was cleared during
+        # an OrderLookupUnconfirmed reconciliation, B10). Store it so the
+        # BUYING/SELLING reconciliation path (update_order_status()) and the
+        # cancel/reprice path (cancel_order()) - which both read
+        # App.order.get("orderId") - can act on it next cycle instead of
+        # stalling with a status set but no order to reconcile against.
+        # Overwriting is intentionally idempotent: if App.order already
+        # references this exact order (same orderId), this just refreshes it
+        # with the latest exchange fields, matching update_order_status()'s
+        # own order.update(new_order) pattern elsewhere in this file.
+        App.order = order
+        App.order_time = now_timestamp()
+
     else:  # Many orders
+        # Ambiguous/unsupported state (see known issue 5 in the go-live
+        # checklist: partial fills and races around multiple resting orders
+        # are not handled yet). Do NOT guess which order is "the" order by
+        # picking one - that could silently cancel/reprice the wrong side.
+        # Leave App.order/App.status untouched and fail loudly so a human
+        # intervenes, exactly like the pre-existing behavior here.
         log.error(f"Wrong state. More than one open order. Fix manually.")
         return None
 

@@ -30,6 +30,7 @@ from outputs.trader_binance import (
     _get_order_by_client_id,
     new_limit_order,
     trader_binance,
+    update_trade_status,
 )
 
 
@@ -883,4 +884,103 @@ def test_trader_binance_adopt_existing_order_on_duplicate_client_id_sets_buying_
         asyncio.run(trader_binance(df, _MODEL, App.config, model_store=None))
 
     assert App.order == existing_order
+    assert App.status == "BUYING"
+
+
+#
+# B12: update_trade_status() must store a single found open order into
+# App.order (not just derive App.status from it), so later cycles
+# (update_order_status(), cancel_order(), the BUYING/SELLING reconciliation
+# branch in trader_binance()) - which all read App.order.get("orderId") -
+# can act on it instead of stalling.
+#
+
+def test_update_trade_status_no_open_orders_leaves_app_order_none():
+    """
+    Arrange: App.order is None (fresh state) and the exchange reports no
+    open orders.
+    Act: call update_trade_status().
+    Assert: App.order stays None (the "no orders" branch resyncs App.status
+    from account balances only, and must not fabricate an order).
+    """
+    _setup_app_for_trader_binance(no_trades_only_data_processing=False)
+    client = _make_fake_binance_client()
+    client.get_open_orders.return_value = []
+
+    with patch("outputs.trader_binance.collector_binance.client", client):
+        asyncio.run(update_trade_status())
+
+    assert App.order is None
+
+
+def test_update_trade_status_one_open_order_found_stores_it_when_app_order_was_none():
+    """
+    Arrange: App.order is None (e.g. after a restart) but exactly one BUY
+    order is resting on the exchange.
+    Act: call update_trade_status().
+    Assert: App.order is populated with that order (this is the B12 fix -
+    previously only App.status was set, leaving App.order unreconcilable),
+    and App.status reflects the order's side.
+    """
+    _setup_app_for_trader_binance(no_trades_only_data_processing=False)
+    client = _make_fake_binance_client()
+    open_order = {"symbol": "BTCUSDT", "side": SIDE_BUY, "status": "NEW", "orderId": 42}
+    client.get_open_orders.return_value = [open_order]
+
+    with patch("outputs.trader_binance.collector_binance.client", client):
+        asyncio.run(update_trade_status())
+
+    assert App.order == open_order
+    assert App.status == "BUYING"
+
+
+def test_update_trade_status_one_open_order_already_referenced_is_idempotent():
+    """
+    Arrange: App.order already correctly references the single open order
+    reported by the exchange (same orderId).
+    Act: call update_trade_status().
+    Assert: App.order still equals the (refreshed) order data - no duplicate
+    side effects such as falling through to the "no open orders" account
+    balance resync path.
+    """
+    _setup_app_for_trader_binance(no_trades_only_data_processing=False)
+    client = _make_fake_binance_client()
+    open_order = {"symbol": "BTCUSDT", "side": SIDE_SELL, "status": "NEW", "orderId": 42}
+    App.order = {"symbol": "BTCUSDT", "side": SIDE_SELL, "status": "NEW", "orderId": 42}
+    client.get_open_orders.return_value = [open_order]
+
+    with patch("outputs.trader_binance.collector_binance.client", client):
+        asyncio.run(update_trade_status())
+
+    assert App.order == open_order
+    assert App.status == "SELLING"
+    # The "no open orders" branch (account-balance resync) must not have run.
+    client.get_asset_balance.assert_not_called()
+
+
+def test_update_trade_status_multiple_open_orders_leaves_app_order_and_status_untouched():
+    """
+    Arrange: App.order is a known, pre-existing order but the exchange now
+    reports two open orders (an ambiguous/unsupported state per known issue
+    5 in the go-live checklist).
+    Act: call update_trade_status().
+    Assert: it does NOT guess which order is "the" order - App.order and
+    App.status are left exactly as they were, and it returns None so the
+    caller/log surfaces the problem instead of silently picking one.
+    """
+    _setup_app_for_trader_binance(no_trades_only_data_processing=False)
+    client = _make_fake_binance_client()
+    original_order = {"symbol": "BTCUSDT", "side": SIDE_BUY, "status": "NEW", "orderId": 1}
+    App.order = original_order
+    App.status = "BUYING"
+    client.get_open_orders.return_value = [
+        {"symbol": "BTCUSDT", "side": SIDE_BUY, "status": "NEW", "orderId": 1},
+        {"symbol": "BTCUSDT", "side": SIDE_SELL, "status": "NEW", "orderId": 2},
+    ]
+
+    with patch("outputs.trader_binance.collector_binance.client", client):
+        result = asyncio.run(update_trade_status())
+
+    assert result is None
+    assert App.order == original_order
     assert App.status == "BUYING"
