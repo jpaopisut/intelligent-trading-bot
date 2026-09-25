@@ -140,7 +140,21 @@ async def trader_binance(df, model: dict, config: dict, model_store: ModelStore)
 
     if status == "SOLD" and signal_side == "BUY":
         # -----
-        order = await new_limit_order(side=SIDE_BUY, close_time=close_time)
+        try:
+            order = await new_limit_order(side=SIDE_BUY, close_time=close_time)
+        except OrderLookupUnconfirmed as e:
+            # create_order() failed and the follow-up reconciliation lookup could not
+            # confirm the true exchange state either. We must not silently retry with
+            # a fresh (differently-timed) clientOrderId on the next bar - that could
+            # create a second real order on top of one whose fate is unknown. Mark the
+            # state as pending BUYING (mirroring a normal in-flight buy order) so the
+            # existing BUYING/SELLING reconciliation path at the top of this function
+            # (update_order_status()/update_trade_status()) resolves it against the
+            # exchange via get_open_orders() before any new order is attempted (B10).
+            log.error(f"Order lookup unconfirmed after BUY attempt for {symbol}: {e}. "
+                      f"Blocking new submissions until state is confirmed.")
+            App.status = "BUYING"
+            return
 
         if no_trades_only_data_processing:
             print("SKIP TRADING due to 'no_trades_only_data_processing' parameter True")
@@ -151,7 +165,14 @@ async def trader_binance(df, model: dict, config: dict, model_store: ModelStore)
         # reject, missing symbol info/filters, missing close price, execute failure)
     elif status == "BOUGHT" and signal_side == "SELL":
         # -----
-        order = await new_limit_order(side=SIDE_SELL, close_time=close_time)
+        try:
+            order = await new_limit_order(side=SIDE_SELL, close_time=close_time)
+        except OrderLookupUnconfirmed as e:
+            # See the matching comment in the BUY branch above (B10).
+            log.error(f"Order lookup unconfirmed after SELL attempt for {symbol}: {e}. "
+                      f"Blocking new submissions until state is confirmed.")
+            App.status = "SELLING"
+            return
 
         if no_trades_only_data_processing:
             print("SKIP TRADING due to 'no_trades_only_data_processing' parameter True")

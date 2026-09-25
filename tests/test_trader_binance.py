@@ -726,17 +726,18 @@ def test_new_limit_order_unconfirmed_lookup_raises_and_leaves_app_order_untouche
     assert App.order == sentinel_order
 
 
-def test_trader_binance_unconfirmed_lookup_does_not_advance_status_and_propagates():
+def test_trader_binance_unconfirmed_lookup_marks_pending_and_does_not_propagate():
     """
     Same scenario as above but driven through trader_binance(), the real
     caller chain used in production.
     Act: run trader_binance() with a BUY signal while create_order() fails and
     the reconciliation lookup is unconfirmed (non -2013) even after retries.
-    Assert: the exception propagates out of trader_binance() (it is not
-    swallowed to silently resume normal flow), and App.status is NOT advanced
-    to "BUYING" - distinguishing this from the confirmed "order not found"
-    (-2013) path where App.status also correctly stays unchanged, but for a
-    known, safe reason instead of an unknown one.
+    Assert (B10 fix): trader_binance() catches OrderLookupUnconfirmed itself
+    (it does not propagate and crash the caller/event loop) and marks the
+    pending attempt via App.status = "BUYING" so the existing BUYING/SELLING
+    reconciliation path at the top of trader_binance() resolves the real
+    exchange state on the next cycle instead of silently retrying with a
+    brand-new order.
     """
     _setup_app_for_trader_binance(no_trades_only_data_processing=False)
     App.config["trade_model"]["simulate_order_execution"] = False
@@ -748,10 +749,60 @@ def test_trader_binance_unconfirmed_lookup_does_not_advance_status_and_propagate
 
     with patch("outputs.trader_binance.collector_binance.client", client), \
          patch("outputs.trader_binance.time.sleep"):
-        with pytest.raises(OrderLookupUnconfirmed):
-            asyncio.run(trader_binance(df, _MODEL, App.config, model_store=None))
+        asyncio.run(trader_binance(df, _MODEL, App.config, model_store=None))
 
-    assert App.status == "SOLD"  # unchanged - must not advance on unconfirmed state
+    # Marked as pending BUYING (not left as SOLD) so a next-cycle BUY signal
+    # cannot slip through the "status == SOLD and signal_side == BUY" branch
+    # and submit a second, independent order while the first is unresolved.
+    assert App.status == "BUYING"
+
+
+def test_trader_binance_unconfirmed_lookup_then_next_cycle_does_not_submit_second_order():
+    """
+    Regression test for the B10 HIGH finding: after an unconfirmed lookup on a
+    BUY attempt, the very next trader_binance() cycle (still receiving the
+    same BUY signal) must NOT call create_order() again - it must instead
+    reconcile against the exchange via the existing BUYING/SELLING status
+    path (update_order_status()/update_trade_status()), which itself performs
+    no order creation.
+
+    Arrange: first cycle - create_order() fails and reconciliation is
+    unconfirmed. Second cycle - the exchange reports no open orders (e.g. the
+    original create_order() call never actually reached the exchange), which
+    update_trade_status() uses to resync App.status back to "SOLD".
+    Assert: create_order() was called exactly once across both cycles - the
+    second cycle never reaches the BUY-order-submission branch because the
+    pending "BUYING" status is reconciled first (and reconciliation resolves
+    to SOLD without creating any order).
+    """
+    _setup_app_for_trader_binance(no_trades_only_data_processing=False)
+    App.config["trade_model"]["simulate_order_execution"] = False
+    App.config["base_asset"] = "BTC"
+    App.config["quote_asset"] = "USDT"
+    df = _make_buy_signal_df()
+
+    client = _make_fake_binance_client(min_notional="1.00000000")
+    client.create_order.side_effect = TimeoutError("request timed out")
+    client.get_order.side_effect = _make_binance_api_exception(-1021, "Timestamp outside recvWindow.")
+
+    with patch("outputs.trader_binance.collector_binance.client", client), \
+         patch("outputs.trader_binance.time.sleep"):
+        # First cycle: unconfirmed lookup -> pending BUYING, no order stored.
+        asyncio.run(trader_binance(df, _MODEL, App.config, model_store=None))
+        assert App.status == "BUYING"
+        assert client.create_order.call_count == 1
+
+        # Second cycle: reconciliation runs first (status == BUYING). No open
+        # orders exist on the exchange, so update_trade_status() resyncs to
+        # SOLD purely from account state - no new order is attempted this
+        # cycle either.
+        client.get_open_orders.return_value = []
+        client.get_asset_balance.side_effect = lambda asset: {"free": "1000.00000000"}
+        asyncio.run(trader_binance(df, _MODEL, App.config, model_store=None))
+
+    # create_order() must still have been called exactly once in total: the
+    # pending state was reconciled via the exchange, never blindly retried.
+    assert client.create_order.call_count == 1
 
 
 def test_trader_binance_confirmed_not_found_leaves_status_unchanged_distinct_from_unconfirmed():
