@@ -757,6 +757,39 @@ def test_trader_binance_unconfirmed_lookup_marks_pending_and_does_not_propagate(
     assert App.status == "BUYING"
 
 
+def test_trader_binance_unconfirmed_lookup_clears_stale_app_order():
+    """
+    Regression test for the B10 HIGH finding: when App.order already holds a
+    stale, previously-completed order (e.g. the old FILLED SELL right before
+    this BUY attempt) at the moment create_order() fails and the follow-up
+    reconciliation lookup is unconfirmed, App.order must be cleared to None.
+
+    If it were left untouched, the next cycle's BUYING/SELLING reconciliation
+    path would fetch the stale order by its old orderId via
+    update_order_status(), see it is FILLED (because it really was - it's the
+    OLD order), and incorrectly resync App.status from that stale order
+    instead of reconciling the real, unresolved BUY attempt via
+    update_trade_status()/get_open_orders().
+    """
+    _setup_app_for_trader_binance(no_trades_only_data_processing=False)
+    App.config["trade_model"]["simulate_order_execution"] = False
+    df = _make_buy_signal_df()
+
+    # Stale, previously-completed order left over from the prior SELL trade.
+    App.order = {"symbol": "BTCUSDT", "side": SIDE_SELL, "status": "FILLED", "orderId": 1}
+
+    client = _make_fake_binance_client(min_notional="1.00000000")
+    client.create_order.side_effect = TimeoutError("request timed out")
+    client.get_order.side_effect = _make_binance_api_exception(-1021, "Timestamp outside recvWindow.")
+
+    with patch("outputs.trader_binance.collector_binance.client", client), \
+         patch("outputs.trader_binance.time.sleep"):
+        asyncio.run(trader_binance(df, _MODEL, App.config, model_store=None))
+
+    assert App.status == "BUYING"
+    assert App.order is None
+
+
 def test_trader_binance_unconfirmed_lookup_then_next_cycle_does_not_submit_second_order():
     """
     Regression test for the B10 HIGH finding: after an unconfirmed lookup on a

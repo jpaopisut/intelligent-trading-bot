@@ -153,6 +153,15 @@ async def trader_binance(df, model: dict, config: dict, model_store: ModelStore)
             # exchange via get_open_orders() before any new order is attempted (B10).
             log.error(f"Order lookup unconfirmed after BUY attempt for {symbol}: {e}. "
                       f"Blocking new submissions until state is confirmed.")
+            # App.order may still hold a PREVIOUS, completed order (e.g. the
+            # old FILLED SELL right before this BUY attempt). If left as-is,
+            # the next cycle's BUYING/SELLING reconciliation would fetch that
+            # stale order by its old orderId via update_order_status() and
+            # mistake it for the outcome of this unconfirmed attempt. Clear
+            # it so the next cycle instead falls back to update_trade_status()
+            # (get_open_orders()/account balances), which reflects the real
+            # exchange state (B10).
+            App.order = None
             App.status = "BUYING"
             return
 
@@ -171,6 +180,10 @@ async def trader_binance(df, model: dict, config: dict, model_store: ModelStore)
             # See the matching comment in the BUY branch above (B10).
             log.error(f"Order lookup unconfirmed after SELL attempt for {symbol}: {e}. "
                       f"Blocking new submissions until state is confirmed.")
+            # See the matching comment in the BUY branch above (B10): clear
+            # App.order so the stale, previously-completed order cannot be
+            # mistaken for this unconfirmed attempt on the next cycle.
+            App.order = None
             App.status = "SELLING"
             return
 
