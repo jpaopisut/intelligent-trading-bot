@@ -120,3 +120,28 @@ def test_nan_price_rows_do_not_corrupt_equity_metrics(tmp_path):
     assert result["sharpe"] == result["sharpe"] and result["sharpe"] != 0.0
     assert result["trades"] == 1
     assert result["net_return_%"] == pytest.approx(round(100 * (104 / 100 - 1), 2))
+
+
+def test_holdout_split_reports_two_independent_subperiods(tmp_path):
+    # Arrange: 48 hourly bars; holdout from bar 12, split at bar 30
+    times = pd.date_range("2025-01-01T00:00:00Z", periods=48, freq="h")
+    df = pd.DataFrame({
+        "timestamp": times.strftime("%Y-%m-%dT%H:%M:%S.%f+00:00"),
+        "open": [100.0 + i for i in range(48)],
+        "close": [100.5 + i for i in range(48)],
+        "buy_signal_column": [i % 6 == 0 for i in range(48)],
+        "sell_signal_column": [i % 6 == 3 for i in range(48)],
+    })
+    file = tmp_path / "signals.csv"
+    df.to_csv(file, index=False)
+    args = evaluate_signals.build_parser().parse_args([
+        "--file", str(file), "--holdout-start", str(times[12]), "--holdout-split", str(times[30])])
+
+    # Act
+    result = evaluate_signals.run(args)
+
+    # Assert
+    assert result["HOLDOUT_A"]["bars"] == 18
+    assert result["HOLDOUT_B"]["bars"] == 18
+    assert result["HOLDOUT"]["bars"] == 36
+    assert result["HOLDOUT_A"]["period"].startswith(str(times[12])[:19])
