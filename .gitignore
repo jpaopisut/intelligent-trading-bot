@@ -257,3 +257,9 @@ config.json
 # Loop run artifacts and local secrets
 loop/runs/
 configs/local-*.jsonc
+
+# Private research (tracked in the separate private repo via .research.git)
+.claude/
+loop/
+configs/experiments/
+.research.git/

@@ -1,0 +1,47 @@
+# Locked environment for macOS 13 Intel (x86_64), Python 3.12 - 2026-09-24
+# Requires: brew install libomp (for lightgbm). TensorFlow/Keras omitted: no numpy 2 wheels for Intel Mac, so algo 'nn' is unavailable.
+# Install: python3.12 -m venv .venv && .venv/bin/pip install --only-binary=:all: -r requirements-macos-x86.txt
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.3
+aiosignal==1.4.0
+APScheduler==3.11.3
+attrs==26.1.0
+certifi==2026.7.22
+charset-normalizer==3.5.1
+click==8.5.0
+cloudpickle==3.1.2
+dateparser==1.4.3
+frozenlist==1.8.0
+idna==3.20
+iniconfig==2.3.0
+joblib==1.6.0
+lightgbm==4.7.0
+llvmlite==0.45.1
+multidict==6.9.1
+narwhals==2.26.0
+numba==0.62.1
+numpy==2.3.5
+packaging==26.3
+pandas==3.0.6
+pluggy==1.6.0
+propcache==0.5.4
+pyarrow==25.0.1
+pycryptodome==3.23.0
+Pygments==2.21.0
+pytest==9.1.1
+python-dateutil==2.9.0.post0
+python_binance==1.0.37
+pytz==2026.4
+regex==2026.9.10
+requests==2.34.2
+scikit-learn==1.9.1
+scipy==1.18.1
+six==1.17.0
+TA-Lib==0.8.1
+threadpoolctl==3.7.0
+tqdm==4.70.1
+typing_extensions==4.16.0
+tzlocal==5.4.4
+urllib3==2.8.0
+websockets==17.1
+yarl==1.25.1
