@@ -18,6 +18,15 @@ from common.gen_features import *
 from common.utils import compute_scores_regression, compute_scores
 from common.generators import train_feature_set, predict_feature_set
 
+#
+# Naming pattern for the per-step temporary ModelStore directories created by the
+# per-step parallel loop (see _run_one_step). Used both when creating the temp dir and
+# when sweeping for leftover dirs from a previous hard-killed run (see
+# sweep_leftover_temp_model_dirs). Keep these two prefixes in sync.
+#
+TMP_MODEL_DIR_PREFIX = "itb_rolling_predict_step_"
+
+
 """
 Generate label predictions for the whole input feature matrix by iteratively training models using historic data and predicting labels for some future horizon.
 The main parameter is the step of iteration, that is, the future horizon for prediction.
@@ -168,6 +177,14 @@ def main(config_file):
     max_workers = rp_config.get("max_workers", None)
 
     if use_multiprocessing:
+        # A previous run may have been killed hard (OOM/SIGKILL) while a worker still held
+        # its own temp ModelStore directory open; try/finally inside the worker cannot catch
+        # SIGKILL, so such directories are never cleaned up by the worker itself. Sweep them
+        # here, before starting new work, so they do not accumulate across runs.
+        removed_leftover_dirs = sweep_leftover_temp_model_dirs()
+        if removed_leftover_dirs:
+            print(f"Removed {len(removed_leftover_dirs)} leftover temp model dir(s) from a previous run: {removed_leftover_dirs}")
+
         # Parallelise across walk-forward steps (they are independent given the fixed data).
         # Each worker computes its own train/predict slice and must NOT nest another
         # multiprocessing pool inside (parallel=None passed to execute_train_predict_step).
@@ -180,8 +197,13 @@ def main(config_file):
             )
             for step in range(prediction_steps)
         )
-        # step_results is already returned in submission (step) order by joblib.Parallel,
-        # regardless of worker completion order, so concatenation below preserves step order.
+        # joblib.Parallel is documented to return results in submission (step) order,
+        # regardless of worker completion order. We do not simply trust that contract:
+        # explicitly sort by step index and then assert the sorted indices are exactly the
+        # expected contiguous 0..prediction_steps-1 sequence with no duplicates/gaps, so a
+        # violation (or a bug in how steps are submitted) fails loudly instead of silently
+        # concatenating rows in the wrong order.
+        step_results = _sort_and_validate_step_results(step_results, prediction_steps)
         for step, predict_labels_df in step_results:
             labels_hat_df = pd.concat([labels_hat_df, predict_labels_df])
     else:
@@ -266,6 +288,65 @@ def main(config_file):
     print(f"Finished rolling prediction in {str(elapsed).split('.')[0]}")
 
 
+def _sort_and_validate_step_results(step_results, prediction_steps: int):
+    """
+    Defensively sort per-step (step, predict_labels_df) results by step index before they
+    are concatenated, and assert that the sorted step indices are exactly the expected
+    contiguous sequence 0..prediction_steps-1 with no duplicates and no gaps.
+
+    joblib.Parallel documents that results are returned in submission order, but we do not
+    rely on that undocumented-in-code guarantee silently: if it is ever violated (or a step
+    is dropped/duplicated by a bug elsewhere), this raises immediately instead of silently
+    concatenating rows for the wrong walk-forward window.
+
+    :param step_results: iterable of (step, predict_labels_df) tuples, in any order.
+    :param prediction_steps: expected number of steps.
+    :return: list of (step, predict_labels_df) tuples sorted by step index.
+    :raises ValueError: if the step indices are not exactly {0, 1, ..., prediction_steps-1}.
+    """
+    sorted_results = sorted(step_results, key=lambda item: item[0])
+
+    actual_steps = [step for step, _ in sorted_results]
+    expected_steps = list(range(prediction_steps))
+    if actual_steps != expected_steps:
+        raise ValueError(
+            f"Parallel step results have unexpected/duplicate/missing step indices after "
+            f"sorting. Expected exactly {expected_steps}, got {actual_steps}. This indicates "
+            f"a bug in how walk-forward steps were submitted or returned; refusing to "
+            f"concatenate predictions in a possibly wrong order."
+        )
+
+    return sorted_results
+
+
+def sweep_leftover_temp_model_dirs(base_dir: str = None) -> list:
+    """
+    Remove leftover per-step temp ModelStore directories from a previous predict_rolling run
+    that was killed hard (e.g. OOM/SIGKILL) before its worker's own try/finally cleanup could
+    run. Only removes directories whose name matches the exact prefix used by
+    ``_run_one_step`` (``TMP_MODEL_DIR_PREFIX``), so this never touches unrelated directories
+    in the shared temp location.
+
+    :param base_dir: directory to scan (defaults to the system temp directory, i.e. the same
+        base directory ``tempfile.mkdtemp`` uses).
+    :return: list of removed directory paths (as strings), for logging.
+    """
+    scan_dir = Path(base_dir) if base_dir else Path(tempfile.gettempdir())
+    if not scan_dir.is_dir():
+        return []
+
+    removed = []
+    for entry in scan_dir.iterdir():
+        if not entry.is_dir():
+            continue
+        if not entry.name.startswith(TMP_MODEL_DIR_PREFIX):
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        removed.append(str(entry))
+
+    return removed
+
+
 def _run_one_step(
     config: dict,
     df: pd.DataFrame,
@@ -299,7 +380,7 @@ def _run_one_step(
     """
     tmp_model_dir = None
     if isolate_model_store:
-        tmp_model_dir = tempfile.mkdtemp(prefix=f"itb_rolling_predict_step_{step}_")
+        tmp_model_dir = tempfile.mkdtemp(prefix=f"{TMP_MODEL_DIR_PREFIX}{step}_")
         step_config = dict(config)
         step_config["model_folder"] = tmp_model_dir
         App.model_store = ModelStore(step_config)
