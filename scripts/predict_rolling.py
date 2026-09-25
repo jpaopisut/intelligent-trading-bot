@@ -26,6 +26,16 @@ from common.generators import train_feature_set, predict_feature_set
 #
 TMP_MODEL_DIR_PREFIX = "itb_rolling_predict_step_"
 
+#
+# Minimum age (mtime) a temp model dir must have before sweep_leftover_temp_model_dirs()
+# will remove it. A live worker's temp dir is touched/modified continuously while the step
+# executes, so its mtime stays recent; only a dir abandoned by a hard-killed (OOM/SIGKILL)
+# run will be older than this. This guards against a sweep from one concurrently-running
+# predict_rolling.py process deleting another concurrently-running process's still-active
+# temp dir (both would match the same name prefix).
+#
+STALE_TEMP_DIR_AGE_SECONDS = 3 * 60 * 60  # 3 hours
+
 
 """
 Generate label predictions for the whole input feature matrix by iteratively training models using historic data and predicting labels for some future horizon.
@@ -319,27 +329,43 @@ def _sort_and_validate_step_results(step_results, prediction_steps: int):
     return sorted_results
 
 
-def sweep_leftover_temp_model_dirs(base_dir: str = None) -> list:
+def sweep_leftover_temp_model_dirs(base_dir: str = None, now: float = None) -> list:
     """
     Remove leftover per-step temp ModelStore directories from a previous predict_rolling run
     that was killed hard (e.g. OOM/SIGKILL) before its worker's own try/finally cleanup could
     run. Only removes directories whose name matches the exact prefix used by
-    ``_run_one_step`` (``TMP_MODEL_DIR_PREFIX``), so this never touches unrelated directories
-    in the shared temp location.
+    ``_run_one_step`` (``TMP_MODEL_DIR_PREFIX``) AND whose mtime is older than
+    ``STALE_TEMP_DIR_AGE_SECONDS``, so this never touches unrelated directories in the shared
+    temp location, nor a same-prefix temp dir that belongs to another predict_rolling.py
+    process currently running concurrently on the same host (its mtime is kept recent by the
+    live worker still writing to it).
 
     :param base_dir: directory to scan (defaults to the system temp directory, i.e. the same
         base directory ``tempfile.mkdtemp`` uses).
+    :param now: reference timestamp (seconds since epoch) used to compute dir age; defaults to
+        the current time. Exposed for testing.
     :return: list of removed directory paths (as strings), for logging.
     """
     scan_dir = Path(base_dir) if base_dir else Path(tempfile.gettempdir())
     if not scan_dir.is_dir():
         return []
 
+    reference_time = now if now is not None else time.time()
+
     removed = []
     for entry in scan_dir.iterdir():
         if not entry.is_dir():
             continue
         if not entry.name.startswith(TMP_MODEL_DIR_PREFIX):
+            continue
+        try:
+            dir_age_seconds = reference_time - entry.stat().st_mtime
+        except OSError:
+            # Dir vanished between iterdir() and stat() (e.g. removed by its own owning
+            # process concurrently) - nothing to do, skip it.
+            continue
+        if dir_age_seconds < STALE_TEMP_DIR_AGE_SECONDS:
+            # Recently touched: could belong to a currently-running concurrent process.
             continue
         shutil.rmtree(entry, ignore_errors=True)
         removed.append(str(entry))

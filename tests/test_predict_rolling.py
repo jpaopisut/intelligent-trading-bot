@@ -5,6 +5,7 @@ sequential and the per-step-parallel loops in predict_rolling.main(), with
 execute_train_predict_step() monkeypatched to a cheap deterministic stub (real LightGBM/SVC
 training would be too slow for a unit test and is already covered by test_classifiers.py).
 """
+import os
 import time
 
 import pandas as pd
@@ -256,7 +257,8 @@ def test_run_one_step_cleans_up_temp_dir_when_worker_raises(monkeypatch):
 
 def test_sweep_leftover_temp_model_dirs_removes_only_matching_dirs(tmp_path):
     # Arrange: a leftover temp dir from a previous (simulated) hard-killed run, plus an
-    # unrelated directory that must be left alone.
+    # unrelated directory that must be left alone. Simulate staleness by evaluating the
+    # sweep at a reference time far in the future of the dirs' mtime.
     leftover_dir = tmp_path / f"{TMP_MODEL_DIR_PREFIX}2_abc123"
     leftover_dir.mkdir()
     (leftover_dir / "some_model.bin").write_text("stale model bytes")
@@ -265,11 +267,46 @@ def test_sweep_leftover_temp_model_dirs_removes_only_matching_dirs(tmp_path):
     unrelated_dir.mkdir()
     (unrelated_dir / "keep_me.txt").write_text("do not touch")
 
+    stale_reference_time = time.time() + predict_rolling.STALE_TEMP_DIR_AGE_SECONDS + 60
+
     # Act
-    removed = sweep_leftover_temp_model_dirs(base_dir=str(tmp_path))
+    removed = sweep_leftover_temp_model_dirs(base_dir=str(tmp_path), now=stale_reference_time)
 
     # Assert
     assert removed == [str(leftover_dir)]
     assert not leftover_dir.exists()
     assert unrelated_dir.exists()
     assert (unrelated_dir / "keep_me.txt").exists()
+
+
+def test_sweep_leftover_temp_model_dirs_spares_fresh_concurrent_run_dir(tmp_path):
+    """Regression test for the race condition where sweeping on startup could delete another
+    concurrently-running predict_rolling.py process's still-active temp model dir, because both
+    match the same name prefix. Only a dir whose mtime is older than
+    STALE_TEMP_DIR_AGE_SECONDS (i.e. abandoned by a hard-killed run) must be removed; a dir
+    that was touched recently (as a live worker continuously does while executing its step)
+    must be left alone."""
+    # Arrange: two dirs from two different "runs", both matching the prefix.
+    stale_dir = tmp_path / f"{TMP_MODEL_DIR_PREFIX}0_stalerun"
+    stale_dir.mkdir()
+    (stale_dir / "some_model.bin").write_text("abandoned model bytes")
+
+    fresh_dir = tmp_path / f"{TMP_MODEL_DIR_PREFIX}0_freshrun"
+    fresh_dir.mkdir()
+    (fresh_dir / "some_model.bin").write_text("actively used model bytes")
+
+    reference_time = time.time()
+    stale_mtime = reference_time - predict_rolling.STALE_TEMP_DIR_AGE_SECONDS - 60
+    os.utime(stale_dir, (stale_mtime, stale_mtime))
+    # fresh_dir keeps its just-created (now-ish) mtime, simulating a live worker still
+    # writing to it.
+
+    # Act
+    removed = sweep_leftover_temp_model_dirs(base_dir=str(tmp_path), now=reference_time)
+
+    # Assert: only the stale dir from the abandoned run is removed; the concurrently-running
+    # process's fresh dir survives untouched.
+    assert removed == [str(stale_dir)]
+    assert not stale_dir.exists()
+    assert fresh_dir.exists()
+    assert (fresh_dir / "some_model.bin").exists()
