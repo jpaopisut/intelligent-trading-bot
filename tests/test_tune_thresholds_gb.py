@@ -1,6 +1,11 @@
 import pytest
 
-tuner = pytest.importorskip("loop.scripts.tune_thresholds_gb", reason="loop/ tooling is not part of every checkout")
+import importlib
+from pathlib import Path
+
+if not (Path(__file__).resolve().parents[1] / "loop/scripts/tune_thresholds_gb.py").exists():
+    pytest.skip("loop/ tooling is not part of every checkout", allow_module_level=True)
+tuner = importlib.import_module("loop.scripts.tune_thresholds_gb")  # present but broken must FAIL, not skip
 passes_bar, MIN_TRADES, MIN_PF, MAX_EXPOSURE = tuner.passes_bar, tuner.MIN_TRADES, tuner.MIN_PF, tuner.MAX_EXPOSURE
 
 
