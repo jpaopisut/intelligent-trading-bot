@@ -151,16 +151,16 @@ async def trader_mt5(df: pd.DataFrame, model: dict, config: dict, model_store: M
 
     if status == "SOLD" and signal_side == "BUY":
         # -----
-        await new_limit_order(side=mt5.ORDER_TYPE_BUY_LIMIT)
+        await new_limit_order(symbol, side=mt5.ORDER_TYPE_BUY_LIMIT)
 
         if no_trades_only_data_processing:
             print("SKIP TRADING due to 'no_trades_only_data_processing' parameter True")
             # Never change status if orders not executed
         else:
             App.status = "BUYING"
-    elif status == "BOUGHT" and signal_side == "SELL": 
+    elif status == "BOUGHT" and signal_side == "SELL":
         # -----
-        await new_limit_order(symbol, side=mt5.ORDER_TYPE_SELL)
+        await new_limit_order(symbol, side=mt5.ORDER_TYPE_SELL_LIMIT)
 
         if no_trades_only_data_processing:
             print("SKIP TRADING due to 'no_trades_only_data_processing' parameter True")
@@ -384,6 +384,7 @@ async def new_limit_order(symbol, side):
 
     if trade_model.get("no_trades_only_data_processing"):
         print(f"NOT executed order spec: {order_spec}")
+        order = order_spec
     else:
         order = execute_order(order_spec)
 

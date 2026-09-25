@@ -33,7 +33,7 @@ client = None
 CHUNK_SIZE = 10000  # (int): The number of bars to request in each chunk. How many bars worth of duration to request in each chunk
 TICK_CHUNK_SIZE = 5 # How many ticks worth of duration to request in each chunk
 RATE_LIMIT_DELAY = 0.1  # (float): The delay in seconds between requests. Small delay between requests (seconds)
-default_start_dt = datetime(2014, 1, 1, tzinfo=timezone)  # Or get from config if needed
+default_start_dt = datetime(2014, 1, 1, tzinfo=timezone.utc)  # Or get from config if needed
 
 time_column = 'timestamp'
 timezone = pytz.timezone("Etc/UTC")
