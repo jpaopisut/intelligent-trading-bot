@@ -24,7 +24,13 @@ from binance.exceptions import BinanceAPIException
 
 from service.App import App
 from common.types import AccountBalances
-from outputs.trader_binance import _generate_client_order_id, new_limit_order, trader_binance
+from outputs.trader_binance import (
+    OrderLookupUnconfirmed,
+    _generate_client_order_id,
+    _get_order_by_client_id,
+    new_limit_order,
+    trader_binance,
+)
 
 
 def _make_fake_analyzer(close_price="100.0"):
@@ -59,7 +65,7 @@ def test_new_limit_order_dry_run_returns_none_and_sets_app_order_none():
     _setup_app(no_trades_only_data_processing=True)
 
     with patch("outputs.trader_binance.collector_binance.client", _make_fake_binance_client()):
-        result = asyncio.run(new_limit_order(SIDE_SELL))
+        result = asyncio.run(new_limit_order(SIDE_SELL, close_time="2024-01-01T00:00:00"))
 
     assert result is None
     assert App.order is None
@@ -76,7 +82,7 @@ def test_new_limit_order_execute_path_still_returns_order():
     _setup_app(no_trades_only_data_processing=False)
 
     with patch("outputs.trader_binance.collector_binance.client", _make_fake_binance_client()):
-        result = asyncio.run(new_limit_order(SIDE_SELL))
+        result = asyncio.run(new_limit_order(SIDE_SELL, close_time="2024-01-01T00:00:00"))
 
     assert result is not None
     assert result["symbol"] == "BTCUSDT"
@@ -240,7 +246,7 @@ def test_new_limit_order_rounds_price_and_quantity_to_exchange_tick_and_step():
     client.get_symbol_info.return_value["filters"][1]["stepSize"] = "0.00010000"
 
     with patch("outputs.trader_binance.collector_binance.client", client):
-        result = asyncio.run(new_limit_order(SIDE_SELL))
+        result = asyncio.run(new_limit_order(SIDE_SELL, close_time="2024-01-01T00:00:00"))
 
     assert result is not None
     assert result["price"] == "100.10"
@@ -260,7 +266,7 @@ def test_new_limit_order_below_min_notional_returns_none_and_does_not_submit():
     client.get_symbol_info.return_value = _make_btcusdt_symbol_info(min_notional="10.00000000")
 
     with patch("outputs.trader_binance.collector_binance.client", client):
-        result = asyncio.run(new_limit_order(SIDE_SELL))
+        result = asyncio.run(new_limit_order(SIDE_SELL, close_time="2024-01-01T00:00:00"))
 
     assert result is None
     assert App.order is None
@@ -281,7 +287,7 @@ def test_new_limit_order_at_min_notional_proceeds_normally():
     client.get_symbol_info.return_value = _make_btcusdt_symbol_info(min_notional="10.00000000")
 
     with patch("outputs.trader_binance.collector_binance.client", client):
-        result = asyncio.run(new_limit_order(SIDE_SELL))
+        result = asyncio.run(new_limit_order(SIDE_SELL, close_time="2024-01-01T00:00:00"))
 
     assert result is not None
     assert result["side"] == SIDE_SELL
@@ -361,7 +367,7 @@ def test_new_limit_order_clears_stale_order_when_symbol_info_missing():
     client.get_symbol_info.return_value = None
 
     with patch("outputs.trader_binance.collector_binance.client", client):
-        result = asyncio.run(new_limit_order(SIDE_SELL))
+        result = asyncio.run(new_limit_order(SIDE_SELL, close_time="2024-01-01T00:00:00"))
 
     assert result is None
     assert App.order is None
@@ -379,7 +385,7 @@ def test_new_limit_order_clears_stale_order_when_filters_missing():
     client.get_symbol_info.return_value = {"symbol": "BTCUSDT", "filters": []}
 
     with patch("outputs.trader_binance.collector_binance.client", client):
-        result = asyncio.run(new_limit_order(SIDE_SELL))
+        result = asyncio.run(new_limit_order(SIDE_SELL, close_time="2024-01-01T00:00:00"))
 
     assert result is None
     assert App.order is None
@@ -398,7 +404,7 @@ def test_new_limit_order_clears_stale_order_when_close_price_missing():
     client.get_symbol_info.return_value = _make_btcusdt_symbol_info(min_notional="1.00000000")
 
     with patch("outputs.trader_binance.collector_binance.client", client):
-        result = asyncio.run(new_limit_order(SIDE_SELL))
+        result = asyncio.run(new_limit_order(SIDE_SELL, close_time="2024-01-01T00:00:00"))
 
     assert result is None
     assert App.order is None
@@ -418,7 +424,7 @@ def test_new_limit_order_handles_notional_filter_renamed_to_notional():
     )
 
     with patch("outputs.trader_binance.collector_binance.client", client):
-        result = asyncio.run(new_limit_order(SIDE_SELL))
+        result = asyncio.run(new_limit_order(SIDE_SELL, close_time="2024-01-01T00:00:00"))
 
     assert result is None
     assert App.order is None
@@ -570,3 +576,311 @@ def test_new_limit_order_duplicate_client_order_id_adopts_existing_order():
     assert App.order == existing_order
     client.get_order.assert_called_once_with(symbol="BTCUSDT", origClientOrderId=expected_id)
     client.create_order.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# B10: harden B09's reconciliation.
+# 1) A lookup failure that is NOT -2013 (confirmed "does not exist") must be
+#    distinguishable from a confirmed not-found, and must NOT be silently
+#    treated as "no order" - it must raise OrderLookupUnconfirmed and block
+#    App.status from advancing.
+# 2) `_get_order_by_client_id` retries a small fixed number of times with a
+#    backoff before giving up and raising OrderLookupUnconfirmed.
+# 3) close_time=None must not produce a non-deterministic clientOrderId - it
+#    is now rejected early (new_limit_order) / raises ValueError
+#    (_generate_client_order_id) instead.
+# ---------------------------------------------------------------------------
+
+def test_generate_client_order_id_close_time_none_raises_value_error():
+    """
+    close_time=None must be rejected explicitly instead of silently falling back
+    to a wall-clock timestamp, which would produce a different id on every call
+    for what is supposed to be the same signal (breaking idempotent retries).
+    """
+    with pytest.raises(ValueError):
+        _generate_client_order_id("BTCUSDT", SIDE_BUY, None)
+
+
+def test_new_limit_order_close_time_none_is_rejected_early_and_deterministic():
+    """
+    Arrange: no close_time passed to new_limit_order (defaults to None).
+    Act: call new_limit_order(SIDE_SELL) twice.
+    Assert: both calls are rejected early (no order submitted, no Binance client
+    calls made at all - not even get_symbol_info), and App.order is cleared to
+    None both times, i.e. the behavior is deterministic (identical) across calls
+    instead of depending on a changing wall-clock timestamp.
+    """
+    _setup_app_for_filters(base_quantity="1.0", close_price="100.0")
+    client = MagicMock()
+
+    with patch("outputs.trader_binance.collector_binance.client", client):
+        result1 = asyncio.run(new_limit_order(SIDE_SELL))
+        result2 = asyncio.run(new_limit_order(SIDE_SELL))
+
+    assert result1 is None
+    assert result2 is None
+    assert App.order is None
+    client.get_symbol_info.assert_not_called()
+    client.create_order.assert_not_called()
+
+
+def test_get_order_by_client_id_not_found_returns_none_without_retry():
+    """
+    Confirmed "order does not exist" (Binance code -2013) is returned as None
+    immediately, without retrying (it is a definitive answer, not a transient
+    lookup failure).
+    """
+    client = MagicMock()
+    client.get_order.side_effect = _make_binance_api_exception(-2013, "Order does not exist.")
+
+    with patch("outputs.trader_binance.collector_binance.client", client):
+        result = _get_order_by_client_id("BTCUSDT", "itb-some-id")
+
+    assert result is None
+    assert client.get_order.call_count == 1
+
+
+def test_get_order_by_client_id_transient_failure_retries_then_raises_unconfirmed():
+    """
+    Arrange: get_order() keeps failing with a non -2013 error (e.g. a different
+    Binance error code, simulating a transient/rate-limit failure).
+    Act: call _get_order_by_client_id.
+    Assert: it retries a small fixed number of times with a backoff, and only
+    after exhausting retries raises OrderLookupUnconfirmed - never returns None
+    (which would be indistinguishable from a confirmed "no order").
+    """
+    client = MagicMock()
+    client.get_order.side_effect = _make_binance_api_exception(-1021, "Timestamp outside recvWindow.")
+
+    with patch("outputs.trader_binance.collector_binance.client", client), \
+         patch("outputs.trader_binance.time.sleep") as mock_sleep:
+        with pytest.raises(OrderLookupUnconfirmed):
+            _get_order_by_client_id("BTCUSDT", "itb-some-id", max_attempts=3, backoff_seconds=0.01)
+
+    assert client.get_order.call_count == 3
+    assert mock_sleep.call_count == 2  # backoff between attempts, not after the last one
+
+
+def test_get_order_by_client_id_generic_exception_retries_then_raises_unconfirmed():
+    """
+    Same as above but for a bare (non-Binance) Exception, e.g. a network error.
+    """
+    client = MagicMock()
+    client.get_order.side_effect = ConnectionError("network unreachable")
+
+    with patch("outputs.trader_binance.collector_binance.client", client), \
+         patch("outputs.trader_binance.time.sleep"):
+        with pytest.raises(OrderLookupUnconfirmed):
+            _get_order_by_client_id("BTCUSDT", "itb-some-id", max_attempts=3, backoff_seconds=0.01)
+
+    assert client.get_order.call_count == 3
+
+
+def test_get_order_by_client_id_succeeds_after_transient_retry():
+    """
+    A transient failure followed by a successful lookup must return the found
+    order (not raise), i.e. retries genuinely help recover from flaky lookups.
+    """
+    client = MagicMock()
+    found_order = {"symbol": "BTCUSDT", "side": SIDE_SELL, "status": "NEW", "orderId": 7}
+    client.get_order.side_effect = [ConnectionError("network blip"), found_order]
+
+    with patch("outputs.trader_binance.collector_binance.client", client), \
+         patch("outputs.trader_binance.time.sleep"):
+        result = _get_order_by_client_id("BTCUSDT", "itb-some-id", max_attempts=3, backoff_seconds=0.01)
+
+    assert result == found_order
+    assert client.get_order.call_count == 2
+
+
+def test_new_limit_order_unconfirmed_lookup_raises_and_leaves_app_order_untouched():
+    """
+    Arrange: create_order() raises (unknown outcome), and every reconciliation
+    get_order() attempt also fails with a non -2013 error (state genuinely
+    unknown after retries).
+    Act: call new_limit_order(SIDE_SELL, close_time=...).
+    Assert: OrderLookupUnconfirmed propagates out (it is NOT swallowed into a
+    `None` "no order" result), and App.order/App.order_time are left untouched
+    (not overwritten to None), so the caller cannot mistake this for a
+    confirmed "no order" state.
+    """
+    _setup_app_for_filters(base_quantity="1.0", close_price="100.0")
+    App.config["trade_model"]["simulate_order_execution"] = False
+    sentinel_order = {"symbol": "BTCUSDT", "side": SIDE_SELL, "status": "NEW", "orderId": 555}
+    App.order = sentinel_order
+    close_time = "2024-01-01T00:09:00"
+
+    client = MagicMock()
+    client.get_symbol_info.return_value = _make_btcusdt_symbol_info(min_notional="1.00000000")
+    client.create_order.side_effect = TimeoutError("request timed out")
+    client.get_order.side_effect = _make_binance_api_exception(-1021, "Timestamp outside recvWindow.")
+
+    with patch("outputs.trader_binance.collector_binance.client", client), \
+         patch("outputs.trader_binance.time.sleep"):
+        with pytest.raises(OrderLookupUnconfirmed):
+            asyncio.run(new_limit_order(SIDE_SELL, close_time=close_time))
+
+    # State must be left exactly as it was before this call - not cleared to
+    # None (that would look like "confirmed no order" everywhere else in the
+    # file, e.g. `elif order:` checks in trader_binance()).
+    assert App.order == sentinel_order
+
+
+def test_trader_binance_unconfirmed_lookup_marks_pending_and_does_not_propagate():
+    """
+    Same scenario as above but driven through trader_binance(), the real
+    caller chain used in production.
+    Act: run trader_binance() with a BUY signal while create_order() fails and
+    the reconciliation lookup is unconfirmed (non -2013) even after retries.
+    Assert (B10 fix): trader_binance() catches OrderLookupUnconfirmed itself
+    (it does not propagate and crash the caller/event loop) and marks the
+    pending attempt via App.status = "BUYING" so the existing BUYING/SELLING
+    reconciliation path at the top of trader_binance() resolves the real
+    exchange state on the next cycle instead of silently retrying with a
+    brand-new order.
+    """
+    _setup_app_for_trader_binance(no_trades_only_data_processing=False)
+    App.config["trade_model"]["simulate_order_execution"] = False
+    df = _make_buy_signal_df()
+
+    client = _make_fake_binance_client(min_notional="1.00000000")
+    client.create_order.side_effect = TimeoutError("request timed out")
+    client.get_order.side_effect = _make_binance_api_exception(-1021, "Timestamp outside recvWindow.")
+
+    with patch("outputs.trader_binance.collector_binance.client", client), \
+         patch("outputs.trader_binance.time.sleep"):
+        asyncio.run(trader_binance(df, _MODEL, App.config, model_store=None))
+
+    # Marked as pending BUYING (not left as SOLD) so a next-cycle BUY signal
+    # cannot slip through the "status == SOLD and signal_side == BUY" branch
+    # and submit a second, independent order while the first is unresolved.
+    assert App.status == "BUYING"
+
+
+def test_trader_binance_unconfirmed_lookup_clears_stale_app_order():
+    """
+    Regression test for the B10 HIGH finding: when App.order already holds a
+    stale, previously-completed order (e.g. the old FILLED SELL right before
+    this BUY attempt) at the moment create_order() fails and the follow-up
+    reconciliation lookup is unconfirmed, App.order must be cleared to None.
+
+    If it were left untouched, the next cycle's BUYING/SELLING reconciliation
+    path would fetch the stale order by its old orderId via
+    update_order_status(), see it is FILLED (because it really was - it's the
+    OLD order), and incorrectly resync App.status from that stale order
+    instead of reconciling the real, unresolved BUY attempt via
+    update_trade_status()/get_open_orders().
+    """
+    _setup_app_for_trader_binance(no_trades_only_data_processing=False)
+    App.config["trade_model"]["simulate_order_execution"] = False
+    df = _make_buy_signal_df()
+
+    # Stale, previously-completed order left over from the prior SELL trade.
+    App.order = {"symbol": "BTCUSDT", "side": SIDE_SELL, "status": "FILLED", "orderId": 1}
+
+    client = _make_fake_binance_client(min_notional="1.00000000")
+    client.create_order.side_effect = TimeoutError("request timed out")
+    client.get_order.side_effect = _make_binance_api_exception(-1021, "Timestamp outside recvWindow.")
+
+    with patch("outputs.trader_binance.collector_binance.client", client), \
+         patch("outputs.trader_binance.time.sleep"):
+        asyncio.run(trader_binance(df, _MODEL, App.config, model_store=None))
+
+    assert App.status == "BUYING"
+    assert App.order is None
+
+
+def test_trader_binance_unconfirmed_lookup_then_next_cycle_does_not_submit_second_order():
+    """
+    Regression test for the B10 HIGH finding: after an unconfirmed lookup on a
+    BUY attempt, the very next trader_binance() cycle (still receiving the
+    same BUY signal) must NOT call create_order() again - it must instead
+    reconcile against the exchange via the existing BUYING/SELLING status
+    path (update_order_status()/update_trade_status()), which itself performs
+    no order creation.
+
+    Arrange: first cycle - create_order() fails and reconciliation is
+    unconfirmed. Second cycle - the exchange reports no open orders (e.g. the
+    original create_order() call never actually reached the exchange), which
+    update_trade_status() uses to resync App.status back to "SOLD".
+    Assert: create_order() was called exactly once across both cycles - the
+    second cycle never reaches the BUY-order-submission branch because the
+    pending "BUYING" status is reconciled first (and reconciliation resolves
+    to SOLD without creating any order).
+    """
+    _setup_app_for_trader_binance(no_trades_only_data_processing=False)
+    App.config["trade_model"]["simulate_order_execution"] = False
+    App.config["base_asset"] = "BTC"
+    App.config["quote_asset"] = "USDT"
+    df = _make_buy_signal_df()
+
+    client = _make_fake_binance_client(min_notional="1.00000000")
+    client.create_order.side_effect = TimeoutError("request timed out")
+    client.get_order.side_effect = _make_binance_api_exception(-1021, "Timestamp outside recvWindow.")
+
+    with patch("outputs.trader_binance.collector_binance.client", client), \
+         patch("outputs.trader_binance.time.sleep"):
+        # First cycle: unconfirmed lookup -> pending BUYING, no order stored.
+        asyncio.run(trader_binance(df, _MODEL, App.config, model_store=None))
+        assert App.status == "BUYING"
+        assert client.create_order.call_count == 1
+
+        # Second cycle: reconciliation runs first (status == BUYING). No open
+        # orders exist on the exchange, so update_trade_status() resyncs to
+        # SOLD purely from account state - no new order is attempted this
+        # cycle either.
+        client.get_open_orders.return_value = []
+        client.get_asset_balance.side_effect = lambda asset: {"free": "1000.00000000"}
+        asyncio.run(trader_binance(df, _MODEL, App.config, model_store=None))
+
+    # create_order() must still have been called exactly once in total: the
+    # pending state was reconciled via the exchange, never blindly retried.
+    assert client.create_order.call_count == 1
+
+
+def test_trader_binance_confirmed_not_found_leaves_status_unchanged_distinct_from_unconfirmed():
+    """
+    Contrast case for the above: create_order() fails and the reconciliation
+    lookup is a *confirmed* not-found (-2013). This must behave like the
+    existing, safe "no order created" path - App.status stays unchanged and,
+    crucially, no exception propagates (unlike the unconfirmed case above).
+    """
+    _setup_app_for_trader_binance(no_trades_only_data_processing=False)
+    App.config["trade_model"]["simulate_order_execution"] = False
+    df = _make_buy_signal_df()
+
+    client = _make_fake_binance_client(min_notional="1.00000000")
+    client.create_order.side_effect = TimeoutError("request timed out")
+    client.get_order.side_effect = _make_binance_api_exception(-2013, "Order does not exist.")
+
+    with patch("outputs.trader_binance.collector_binance.client", client):
+        asyncio.run(trader_binance(df, _MODEL, App.config, model_store=None))
+
+    assert App.order is None
+    assert App.status == "SOLD"
+
+
+def test_trader_binance_adopt_existing_order_on_duplicate_client_id_sets_buying_status():
+    """
+    Arrange: create_order() raises a duplicate-clientOrderId error (-2010)
+    because a previous attempt for the same signal already went through, and
+    the reconciliation lookup finds that existing order.
+    Act: run trader_binance() with a BUY signal.
+    Assert: the existing order is adopted and App.status advances to "BUYING",
+    exactly as it would for a normal successful create_order() call - the
+    caller cannot tell the two apart, which is the point of reconciliation.
+    """
+    _setup_app_for_trader_binance(no_trades_only_data_processing=False)
+    App.config["trade_model"]["simulate_order_execution"] = False
+    df = _make_buy_signal_df()
+
+    client = _make_fake_binance_client(min_notional="1.00000000")
+    client.create_order.side_effect = _make_binance_api_exception(-2010, "Duplicate order sent.")
+    existing_order = {"symbol": "BTCUSDT", "side": SIDE_BUY, "status": "NEW", "orderId": 321}
+    client.get_order.return_value = existing_order
+
+    with patch("outputs.trader_binance.collector_binance.client", client):
+        asyncio.run(trader_binance(df, _MODEL, App.config, model_store=None))
+
+    assert App.order == existing_order
+    assert App.status == "BUYING"
