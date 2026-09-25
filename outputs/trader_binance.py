@@ -353,13 +353,36 @@ def _generate_client_order_id(symbol: str, side: str, close_time) -> str:
     Same inputs always produce the same id, so a retried submission for the same
     signal (e.g. after a process restart) reuses the same id and can be reconciled
     via get_order(origClientOrderId=...) instead of creating a duplicate order (B09).
+
+    `close_time` must be a real (non-None) value identifying the signal. Falling back
+    to a wall-clock timestamp here would make the id different on every call for the
+    same signal, defeating idempotency exactly when it is needed most (retries after
+    a crash/timeout). Callers must always pass a real close_time (B10).
     """
+    if close_time is None:
+        raise ValueError(
+            "_generate_client_order_id: close_time is required and must not be None "
+            "(a non-deterministic fallback would break idempotent order retries)."
+        )
     raw = f"{symbol}-{side}-{close_time}"
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     return f"itb-{digest[:32]}"  # 4 + 32 = 36 chars, within Binance's clientOrderId limit
 
 
-def _get_order_by_client_id(symbol: str, client_order_id: str):
+class OrderLookupUnconfirmed(Exception):
+    """
+    Raised by `_get_order_by_client_id` when the exchange lookup itself failed (after
+    retries) and the true state of the order is unknown - as opposed to a confirmed
+    "order does not exist" (Binance code -2013), which is reported as `None`.
+
+    Callers must NOT treat this the same as `None` ("confirmed no order"): they must
+    block/reject rather than fall through to normal "no order" handling, because we
+    genuinely do not know whether an order exists on the exchange (B10).
+    """
+    pass
+
+
+def _get_order_by_client_id(symbol: str, client_order_id: str, max_attempts: int = 3, backoff_seconds: float = 0.5):
     """
     Look up an order by its client-assigned id.
 
@@ -367,25 +390,47 @@ def _get_order_by_client_id(symbol: str, client_order_id: str):
     unknown (e.g. a timeout) or reported a duplicate newClientOrderId, so a retry never
     creates a second order (B09).
 
-    Returns the order dict if it exists on the exchange, or None if it does not exist
-    there (Binance error code -2013) or the lookup itself fails.
+    Returns the order dict if it exists on the exchange, or None if it is confirmed to
+    not exist there (Binance error code -2013).
+
+    Raises `OrderLookupUnconfirmed` if the lookup itself keeps failing (after
+    `max_attempts` retries with a short backoff) for any other reason: a different
+    Binance error code, a network error, rate limiting, or a generic exception. In
+    that case the true state is unknown and callers must not proceed as if there is
+    no order (B10).
     """
     if not client_order_id:
         return None
 
-    try:
-        return collector_binance.client.get_order(symbol=symbol, origClientOrderId=client_order_id)
-    except BinanceAPIException as e:
-        if getattr(e, "code", None) == -2013:
-            # Order does not exist on the exchange: the original create_order() call
-            # truly failed. Leave the existing B04 "no order" state.
-            log.error(f"No order found for {symbol} with clientOrderId {client_order_id} (code -2013).")
-        else:
-            log.error(f"Binance exception in 'get_order' while reconciling clientOrderId {client_order_id}: {e}")
-        return None
-    except Exception as e:
-        log.error(f"Binance exception in 'get_order' while reconciling clientOrderId {client_order_id}: {e}")
-        return None
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return collector_binance.client.get_order(symbol=symbol, origClientOrderId=client_order_id)
+        except BinanceAPIException as e:
+            if getattr(e, "code", None) == -2013:
+                # Order does not exist on the exchange: the original create_order() call
+                # truly failed. Leave the existing B04 "no order" state.
+                log.error(f"No order found for {symbol} with clientOrderId {client_order_id} (code -2013).")
+                return None
+            last_error = e
+            log.error(
+                f"Binance exception in 'get_order' while reconciling clientOrderId "
+                f"{client_order_id} (attempt {attempt}/{max_attempts}): {e}"
+            )
+        except Exception as e:
+            last_error = e
+            log.error(
+                f"Exception in 'get_order' while reconciling clientOrderId "
+                f"{client_order_id} (attempt {attempt}/{max_attempts}): {e}"
+            )
+
+        if attempt < max_attempts:
+            time.sleep(backoff_seconds)
+
+    raise OrderLookupUnconfirmed(
+        f"Could not confirm order state for {symbol} clientOrderId {client_order_id} "
+        f"after {max_attempts} attempts. Last error: {last_error}"
+    )
 
 
 def _reject_order(reason: str) -> None:
@@ -408,11 +453,26 @@ async def new_limit_order(side, close_time=None):
 
     `close_time` is the signal's close_time and is used (together with symbol and side)
     to derive a deterministic newClientOrderId, so a retried submission for the same
-    signal is idempotent (B09).
+    signal is idempotent (B09). It is required: a missing close_time is rejected early
+    instead of silently falling back to a non-deterministic wall-clock timestamp, which
+    would defeat idempotent retries exactly when B09's protection is needed most (B10).
+
+    May raise `OrderLookupUnconfirmed` (propagated from `execute_order`, not caught
+    here) if create_order() fails and the exchange reconciliation lookup itself also
+    fails after retries. In that case App.order/App.order_time are deliberately left
+    untouched (this function returns/raises before updating them), so the caller must
+    not assume "no order" and must not submit a new order until the state is confirmed
+    on a later cycle (B10).
     """
     symbol = App.config["symbol"]
     now_ts = now_timestamp()
-    client_order_id = _generate_client_order_id(symbol, side, close_time if close_time is not None else now_ts)
+
+    if close_time is None:
+        return _reject_order(
+            f"close_time is required to derive a deterministic clientOrderId for {symbol} "
+            f"{side} order. Order not submitted."
+        )
+    client_order_id = _generate_client_order_id(symbol, side, close_time)
 
     trade_model = App.config.get("trade_model", {})
 
@@ -511,7 +571,16 @@ async def new_limit_order(side, close_time=None):
 
 
 def execute_order(order: dict):
-    """Validate and submit order"""
+    """
+    Validate and submit order.
+
+    Raises `OrderLookupUnconfirmed` (propagated from `_get_order_by_client_id`, not
+    caught here) if create_order() fails and the follow-up reconciliation lookup also
+    fails to confirm the order's true state on the exchange. This is intentional: the
+    caller (`new_limit_order`) must not treat an unconfirmed lookup as "no order" and
+    must not overwrite App.order/App.status, so a new (possibly duplicate) order is
+    never submitted while the state is unknown (B10).
+    """
 
     trade_model = App.config.get("trade_model", {})
 
