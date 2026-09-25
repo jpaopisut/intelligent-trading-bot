@@ -229,3 +229,150 @@ def test_holdout_split_reports_two_independent_subperiods(tmp_path):
     assert result["HOLDOUT_B"]["bars"] == 18
     assert result["HOLDOUT"]["bars"] == 36
     assert result["HOLDOUT_A"]["period"].startswith(str(times[12])[:19])
+
+
+# --- G06: idle-gated, time-varying core weight -----------------------------------------------
+
+def _idle_gated_fixture(tmp_path: Path) -> Path:
+    # 6 hourly bars, one round-trip trade (buy signal bar0, sell signal bar1), no fees,
+    # execution on next bar's open (lag=1, the default). Same execution trace shape as the
+    # G02 hand-computed test, extended with 3 extra flat bars after the exit to exercise idle-gating.
+    #
+    # Execution trace:
+    #   bar1 (j=bar0): buy fills at open[1]=100 -> units=0.01, cash=0. strategy_equity[1]=1.0
+    #   bar2 (j=bar1): sell fills at open[2]=102 -> cash=0.01*102=1.02, units=0. strategy_equity[2]=1.02
+    # Strategy equity: [1.0, 1.0, 1.02, 1.02, 1.02, 1.02]. in_pos: [F, T, F, F, F, F].
+    # idle (consecutive flat bars, execution-timed, causal): [1, 0, 1, 2, 3, 4].
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2025-01-01T00:00:00Z", periods=6, freq="h").strftime(
+            "%Y-%m-%dT%H:%M:%S.%f+00:00"
+        ),
+        "open":  [100.0, 100.0, 102.0, 103.0, 104.0, 105.0],
+        "close": [100.0, 100.0, 104.0, 104.0, 106.0, 107.0],
+        "buy_signal_column":  [True, False, False, False, False, False],
+        "sell_signal_column": [False, True, False, False, False, False],
+    })
+    file = tmp_path / "signals.csv"
+    df.to_csv(file, index=False)
+    return file
+
+
+def test_core_idle_bars_unset_or_zero_reproduces_exact_g02_constant_blend(tmp_path):
+    # Arrange: the exact G02 fixture and hand-computed numbers from
+    # test_core_weight_half_matches_hand_computed_blended_equity (net_return_%=3.0, buy_hold_%=4.0,
+    # exposure_%=66.7).
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2025-01-01T00:00:00Z", periods=3, freq="h").strftime(
+            "%Y-%m-%dT%H:%M:%S.%f+00:00"
+        ),
+        "open": [100.0, 100.0, 102.0],
+        "close": [100.0, 100.0, 104.0],
+        "buy_signal_column": [True, False, False],
+        "sell_signal_column": [False, True, False],
+    })
+    file = tmp_path / "signals.csv"
+    df.to_csv(file, index=False)
+    no_flag_args = evaluate_signals.build_parser().parse_args(
+        ["--file", str(file), "--core-weight", "0.5", "--fee", "0", "--slippage", "0"]
+    )
+    unset_args = evaluate_signals.build_parser().parse_args(
+        ["--file", str(file), "--core-weight", "0.5", "--fee", "0", "--slippage", "0"]
+    )
+    zero_args = evaluate_signals.build_parser().parse_args(
+        ["--file", str(file), "--core-weight", "0.5", "--core-idle-bars", "0", "--fee", "0", "--slippage", "0"]
+    )
+
+    # Act
+    no_flag = evaluate_signals.run(no_flag_args)["ALL"]
+    unset = evaluate_signals.run(unset_args)["ALL"]
+    zero = evaluate_signals.run(zero_args)["ALL"]
+
+    # Assert: byte-for-byte identical to each other and to the G02 hand-computed numbers.
+    assert no_flag == unset == zero
+    assert zero["net_return_%"] == pytest.approx(3.0)
+    assert zero["buy_hold_%"] == pytest.approx(4.0)
+    assert zero["exposure_%"] == pytest.approx(66.7)
+    # G02 semantics: core sleeve is blended on every bar, not gated -> reported as always active.
+    assert zero["core_active_bars_%"] == 100.0
+    assert zero["core_switches"] == 0
+    assert zero["core_switch_fees_%"] == 0.0
+
+
+def test_core_idle_bars_hand_computed_switches_and_switch_fees(tmp_path):
+    # Arrange: see _idle_gated_fixture for the execution trace and idle counts.
+    # N=2, core_weight=0.4 -> w_t qualifies (0.4) only once idle_t>=2, i.e. bars 3,4,5 (0-indexed).
+    # w = [0.0, 0.0, 0.0, 0.4, 0.4, 0.4] (bar1 is in-position -> forced 0 regardless of idle).
+    # core_ret (from close) = [0, 0, 0.04, 0, 0.019230769..., 0.009433962...]
+    # strat_ret (from strategy equity) = [0, 0, 0.02, 0, 0, 0]
+    # r_t = w_t*core_ret_t + (1-w_t)*strat_ret_t = [0, 0, 0.02, 0, 0.0076923..., 0.0037735...]
+    # delta_w = [0, 0, 0, 0.4, 0, 0] -> one switch (turning on), switch_fee = 0.0005*0.4 = 0.0002 at bar3.
+    # Compounding gives blended equity [1.0, 1.0, 1.02, 1.0197960..., 1.0276405846..., 1.0315184736...]
+    # -> net_return_% = 3.15, fee_drag = 0.000204 -> core_switch_fees_% = 0.02.
+    file = _idle_gated_fixture(tmp_path)
+    args = evaluate_signals.build_parser().parse_args(
+        ["--file", str(file), "--core-weight", "0.4", "--core-idle-bars", "2", "--fee", "0", "--slippage", "0"]
+    )
+
+    # Act
+    result = evaluate_signals.run(args)["ALL"]
+
+    # Assert
+    assert result["net_return_%"] == pytest.approx(3.15)
+    assert result["core_active_bars_%"] == pytest.approx(50.0)
+    assert result["core_switches"] == 1
+    assert result["core_switch_fees_%"] == pytest.approx(0.02)
+    assert result["exposure_%"] == pytest.approx(36.7)
+    # Trade stats stay strategy-only, unaffected by the core sleeve (same as G02).
+    assert result["trades"] == 1
+    assert result["avg_trade_%"] == pytest.approx(2.0)
+    assert result["win_rate_%"] == pytest.approx(100.0)
+
+
+def test_core_idle_bars_no_look_ahead(tmp_path):
+    # Arrange: the same idle-gated fixture, plus a variant where a *future* bar (index 5, the last
+    # one) has a wildly different price and signal. Only bars 0..4 are compared.
+    file_a = _idle_gated_fixture(tmp_path)
+    df_b = pd.read_csv(file_a)
+    df_b.loc[5, ["open", "close"]] = [9999.0, 5.0]
+    df_b.loc[5, "buy_signal_column"] = True
+    file_b = tmp_path / "signals_shifted.csv"
+    df_b.to_csv(file_b, index=False)
+
+    common_kwargs = ["--core-weight", "0.4", "--core-idle-bars", "2", "--fee", "0", "--slippage", "0"]
+    args_a = evaluate_signals.build_parser().parse_args(["--file", str(file_a)] + common_kwargs)
+    args_b = evaluate_signals.build_parser().parse_args(["--file", str(file_b)] + common_kwargs)
+
+    df_a = evaluate_signals.load_frame(file_a, "timestamp")
+    df_b_loaded = evaluate_signals.load_frame(file_b, "timestamp")
+    sim_a = evaluate_signals.simulate(df_a, args_a)
+    sim_b = evaluate_signals.simulate(df_b_loaded, args_b)
+    idle_a = evaluate_signals.compute_idle(sim_a["in_pos"])
+    idle_b = evaluate_signals.compute_idle(sim_b["in_pos"])
+    blend_a = evaluate_signals.core_weight_blend(df_a, sim_a, args_a)
+    blend_b = evaluate_signals.core_weight_blend(df_b_loaded, sim_b, args_b)
+
+    # Act / Assert: idle_t, w_t and the blended equity for bars 0..4 are unaffected by bar 5.
+    assert list(idle_a[:5]) == list(idle_b[:5])
+    assert list(blend_a["w"][:5]) == list(blend_b["w"][:5])
+    assert blend_a["equity"][:5] == pytest.approx(blend_b["equity"][:5])
+
+
+def test_core_weight_zero_is_bit_identical_regardless_of_core_idle_bars(tmp_path):
+    # Arrange
+    file = _idle_gated_fixture(tmp_path)
+    no_idle_args = evaluate_signals.build_parser().parse_args(
+        ["--file", str(file), "--core-weight", "0", "--fee", "0", "--slippage", "0"]
+    )
+    with_idle_args = evaluate_signals.build_parser().parse_args(
+        ["--file", str(file), "--core-weight", "0", "--core-idle-bars", "3", "--fee", "0", "--slippage", "0"]
+    )
+
+    # Act
+    baseline = evaluate_signals.run(no_idle_args)["ALL"]
+    with_idle = evaluate_signals.run(with_idle_args)["ALL"]
+
+    # Assert: bit-identical (w=0 short-circuit bypasses the idle-gating machinery entirely)
+    assert with_idle == baseline
+    assert with_idle["core_active_bars_%"] == 0.0
+    assert with_idle["core_switches"] == 0
+    assert with_idle["core_switch_fees_%"] == 0.0
