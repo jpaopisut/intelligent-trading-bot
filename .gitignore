@@ -263,3 +263,6 @@ configs/local-*.jsonc
 loop/
 configs/experiments/
 .research.git/
+
+# Local forward-test server output
+forward-server.out
